@@ -8,8 +8,12 @@
 # include <cstddef>
 # include <cstdint>
 
+# include "backend/runtime_api.cuh"
+
 # define inline __device__ __forceinline__
-# ifdef __GNUC__
+# if defined(SP1_GPU_BACKEND_ROCM)
+#  define asm(...)
+# elif defined(__GNUC__)
 #  define asm __asm__ __volatile__
 # else
 #  define asm asm volatile

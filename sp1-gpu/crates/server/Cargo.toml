@@ -8,6 +8,16 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[[bin]]
+name = "sp1-gpu-server"
+path = "src/main.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "sp1-rocm-server"
+path = "src/rocm_main.rs"
+required-features = ["rocm"]
+
 [dependencies]
 tokio = { workspace = true }
 sp1-cuda = { workspace = true }
@@ -33,6 +43,9 @@ tikv-jemallocator = { version = "0.6", features = ["profiling", "stats"] }
 workspace = true
 
 [features]
+default = ["cuda"]
+cuda = ["sp1-gpu-cudart/cuda", "sp1-gpu-prover/cuda"]
+rocm = ["sp1-gpu-cudart/rocm", "sp1-gpu-prover/rocm"]
 experimental = ["sp1-prover/experimental", "sp1-gpu-prover/experimental"]
 mprotect = [
   "experimental",

@@ -1,4 +1,4 @@
-add_library(tracegen_objs OBJECT
+sp1_gpu_add_object_library(tracegen_objs OBJECT
     jagged_tracegen/tracegen.cu
     recursion/alu_base.cu
     recursion/alu_ext.cu

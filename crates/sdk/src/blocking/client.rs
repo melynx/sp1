@@ -13,6 +13,9 @@ use sp1_primitives::SP1Field;
 #[cfg(feature = "cuda")]
 use crate::blocking::cuda::builder::CudaProverBuilder;
 
+#[cfg(feature = "rocm")]
+use crate::blocking::rocm::builder::RocmProverBuilder;
+
 #[cfg(feature = "network")]
 use crate::blocking::network::builder::NetworkProverBuilder;
 #[cfg(feature = "network")]
@@ -112,6 +115,27 @@ impl ProverClientBuilder {
     #[allow(clippy::unused_self)]
     pub fn cuda(&self) -> CudaProverBuilder {
         CudaProverBuilder::new_with_machine(self.machine.clone())
+    }
+
+    /// Builds a [`RocmProver`](crate::blocking::RocmProver) specifically for local proving on AMD
+    /// GPUs.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use sp1_sdk::blocking::{Elf, ProveRequest, Prover, ProverClient, SP1Stdin};
+    ///
+    /// let elf = Elf::Static(&[1, 2, 3]);
+    /// let stdin = SP1Stdin::new();
+    ///
+    /// let prover = ProverClient::builder().rocm().build();
+    /// let pk = prover.setup(elf).unwrap();
+    /// let proof = prover.prove(&pk, stdin).compressed().run().unwrap();
+    /// ```
+    #[cfg(feature = "rocm")]
+    #[must_use]
+    #[allow(clippy::unused_self)]
+    pub fn rocm(&self) -> RocmProverBuilder {
+        RocmProverBuilder::new_with_machine(self.machine.clone())
     }
 
     /// Builds a [`MockProver`] for testing without real proving or verification.

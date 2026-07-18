@@ -1,5 +1,5 @@
 
-#include <cuda.h>
+#include "backend/runtime_api.cuh"
 
 #if defined(FEATURE_BLS12_381)
 #include <ff/bls12-381.hpp>

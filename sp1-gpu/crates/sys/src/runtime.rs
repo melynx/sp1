@@ -75,6 +75,7 @@ extern "C" {
     pub static DEFAULT_STREAM: CudaStreamHandle;
 
     pub fn cuda_device_synchronize() -> CudaRustError;
+    pub fn cuda_set_device(device: CudaDevice) -> CudaRustError;
     pub fn cuda_event_create(event: *mut CudaEventHandle) -> CudaRustError;
     pub fn cuda_event_destroy(event: CudaEventHandle) -> CudaRustError;
     pub fn cuda_event_record(event: CudaEventHandle, stream: CudaStreamHandle) -> CudaRustError;

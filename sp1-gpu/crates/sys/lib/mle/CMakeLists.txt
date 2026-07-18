@@ -1,4 +1,4 @@
-add_library(mle_objs OBJECT
+sp1_gpu_add_object_library(mle_objs OBJECT
     fixlastvariable.cu
     mle.cu
 )

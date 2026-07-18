@@ -1,4 +1,3 @@
-#include <cuda/atomic>
 #include "challenger/challenger.cuh"
 #include "poseidon2/poseidon2_kb31_16.cuh"
 #include "poseidon2/poseidon2.cuh"
@@ -7,17 +6,19 @@
 
 
 __global__ void
-grindKernel(DuplexChallenger challenger, kb31_t* result, size_t bits, size_t n, bool* found_flag) {
-    found_flag[0] = false;
-    challenger.grind(bits, result, found_flag, n);
+grindKernel(
+    DuplexChallenger challenger, kb31_t* result, size_t bits, size_t start, size_t end,
+    int* found_flag) {
+    challenger.grind(bits, result, found_flag, start, end);
 }
 
 extern "C" void* grind_koala_bear() { return (void*)grindKernel; }
 
 __global__ void
-grindMultiFieldKernel(MultiField32Challenger challenger, kb31_t* result, size_t bits, size_t n, bool* found_flag) {
-    found_flag[0] = false;
-    challenger.grind(bits, result, found_flag, n);
+grindMultiFieldKernel(
+    MultiField32Challenger challenger, kb31_t* result, size_t bits, size_t start, size_t end,
+    int* found_flag) {
+    challenger.grind(bits, result, found_flag, start, end);
 }
 
 extern "C" void* grind_multi_field32() { return (void*)grindMultiFieldKernel; }

@@ -224,6 +224,34 @@ struct SumAsPolyResult {
     ext_t eqSum;
 };
 
+__device__ __forceinline__ SumAsPolyResult sumAsPolyCircuitValues(
+    CircuitValues valuesZero,
+    CircuitValues valuesOne,
+    size_t colIdx,
+    size_t startIdx,
+    const ext_t* __restrict__ eqRow,
+    const ext_t* __restrict__ eqInteraction,
+    const ext_t lambda,
+    size_t i) {
+    const size_t rowIdx = i - startIdx;
+    const ext_t eqInteractionValue = ext_t::load(eqInteraction, colIdx);
+    const ext_t eqValueZero = ext_t::load(eqRow, rowIdx << 1) * eqInteractionValue;
+    const ext_t eqValueOne = ext_t::load(eqRow, (rowIdx << 1) + 1) * eqInteractionValue;
+    const ext_t eqValueHalf = eqValueZero + eqValueOne;
+
+    CircuitValues valuesHalf;
+    valuesHalf.numeratorZero = valuesZero.numeratorZero + valuesOne.numeratorZero;
+    valuesHalf.numeratorOne = valuesZero.numeratorOne + valuesOne.numeratorOne;
+    valuesHalf.denominatorZero = valuesZero.denominatorZero + valuesOne.denominatorZero;
+    valuesHalf.denominatorOne = valuesZero.denominatorOne + valuesOne.denominatorOne;
+
+    return SumAsPolyResult{
+        valuesZero.sumAsPoly(lambda, eqValueZero),
+        valuesHalf.sumAsPoly(lambda, eqValueHalf),
+        eqValueHalf,
+    };
+}
+
 // Inner sum as poly circuit layer
 // Doesn't do the actual summing, just does the pairwise sums, and the eq sum
 __device__ __forceinline__ SumAsPolyResult sumAsPolyCircuitLayerInner(
@@ -273,7 +301,7 @@ __device__ __forceinline__ SumAsPolyResult sumAsPolyCircuitLayerInner(
     return SumAsPolyResult{evalZero, evalHalf, eqSum};
 }
 
-__device__ __forceinline__ void fixLastVariableInteractionsLayerInner(
+__device__ __forceinline__ CircuitValues fixLastVariableInteractionsLayerInner(
     const ext_t* input,
     ext_t* __restrict__ output,
     ext_t alpha,
@@ -312,6 +340,30 @@ __device__ __forceinline__ void fixLastVariableInteractionsLayerInner(
     ext_t::store(output, outputHeight + i, values.numeratorOne);
     ext_t::store(output, 2 * outputHeight + i, values.denominatorZero);
     ext_t::store(output, 3 * outputHeight + i, values.denominatorOne);
+    return values;
+}
+
+__device__ __forceinline__ SumAsPolyResult sumAsPolyInteractionValues(
+    CircuitValues valuesZero,
+    CircuitValues valuesOne,
+    const ext_t* __restrict__ eqPoly,
+    const ext_t lambda,
+    size_t i) {
+    CircuitValues valuesHalf;
+    valuesHalf.numeratorZero = valuesZero.numeratorZero + valuesOne.numeratorZero;
+    valuesHalf.numeratorOne = valuesZero.numeratorOne + valuesOne.numeratorOne;
+    valuesHalf.denominatorZero = valuesZero.denominatorZero + valuesOne.denominatorZero;
+    valuesHalf.denominatorOne = valuesZero.denominatorOne + valuesOne.denominatorOne;
+
+    const size_t zeroIdx = i << 1;
+    const ext_t eqValueZero = ext_t::load(eqPoly, zeroIdx);
+    const ext_t eqValueOne = ext_t::load(eqPoly, zeroIdx + 1);
+    const ext_t eqValueHalf = eqValueZero + eqValueOne;
+    return SumAsPolyResult{
+        valuesZero.sumAsPoly(lambda, eqValueZero),
+        valuesHalf.sumAsPoly(lambda, eqValueHalf),
+        eqValueHalf,
+    };
 }
 
 // i is between 0 and height / 2.

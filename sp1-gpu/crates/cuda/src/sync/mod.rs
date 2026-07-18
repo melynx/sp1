@@ -19,9 +19,20 @@ impl<T: CudaSend> CudaSend for Option<T> {
     }
 }
 
+impl<T: CudaSend> CudaSend for Vec<T> {
+    unsafe fn send_to_scope(self, scope: &TaskScope) -> Self {
+        self.into_iter().map(|value| unsafe { value.send_to_scope(scope) }).collect()
+    }
+}
+
 impl<T> CudaSend for Buffer<T, TaskScope> {
     #[inline]
     unsafe fn send_to_scope(mut self, scope: &TaskScope) -> Self {
+        assert_eq!(
+            self.allocator().arena_id(),
+            scope.arena_id(),
+            "cannot transfer a device buffer between proof arenas"
+        );
         *self.allocator_mut() = scope.clone();
         self
     }

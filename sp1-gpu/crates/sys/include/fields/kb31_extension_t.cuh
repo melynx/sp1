@@ -103,6 +103,25 @@ class kb31_extension_t {
     }
 
     __device__ __forceinline__ kb31_extension_t& operator*=(const kb31_extension_t b) {
+#if defined(SP1_GPU_BACKEND_ROCM)
+        kb31_t res[7] = {
+            kb31_t::zero(), kb31_t::zero(), kb31_t::zero(), kb31_t::zero(),
+            kb31_t::zero(), kb31_t::zero(), kb31_t::zero(),
+        };
+#pragma unroll
+        for (size_t i = 0; i < D; i++) {
+#pragma unroll
+            for (size_t j = 0; j < D; j++) {
+                res[i + j] += value[i] * b.value[j];
+            }
+        }
+        const kb31_t w = kb31_t(3);
+        value[0] = res[0] + res[4] * w;
+        value[1] = res[1] + res[5] * w;
+        value[2] = res[2] + res[6] * w;
+        value[3] = res[3];
+        return *this;
+#else
         uint32_t x0 = value[0].val, x1 = value[1].val, x2 = value[2].val, x3 = value[3].val,
                  y0 = b.value[0].val, y1 = b.value[1].val, y2 = b.value[2].val, y3 = b.value[3].val;
 
@@ -216,6 +235,7 @@ class kb31_extension_t {
         value[3] = x3 >= MOD ? x3 - MOD : x3;
 
         return *this;
+#endif
     }
 
     __device__ __forceinline__ kb31_extension_t& operator*=(const kb31_t b) {
@@ -308,6 +328,9 @@ class kb31_extension_t {
 
     __device__ __forceinline__ kb31_extension_t
     interpolateLinear(const kb31_extension_t one, const kb31_extension_t zero) const {
+#if defined(SP1_GPU_BACKEND_ROCM)
+        return zero + *this * (one - zero);
+#else
         uint32_t x0 = value[0].val, x1 = value[1].val, x2 = value[2].val, x3 = value[3].val,
                  y0 = one.value[0].val - zero.value[0].val,
                  y1 = one.value[1].val - zero.value[1].val,
@@ -450,10 +473,20 @@ class kb31_extension_t {
         retval.value[2].val = x2;
         retval.value[3].val = x3;
         return retval;
+#endif
     }
 
     __device__ __forceinline__ kb31_extension_t
     interpolateLinear(const kb31_t one, const kb31_t zero) const {
+#if defined(SP1_GPU_BACKEND_ROCM)
+        const kb31_t diff = one - zero;
+        kb31_extension_t retval;
+        retval.value[0] = zero + value[0] * diff;
+        retval.value[1] = value[1] * diff;
+        retval.value[2] = value[2] * diff;
+        retval.value[3] = value[3] * diff;
+        return retval;
+#else
         uint32_t x0 = value[0].val, x1 = value[1].val, x2 = value[2].val, x3 = value[3].val,
                  y0 = one.val - zero.val, y1, y2, y3;
 
@@ -533,5 +566,6 @@ class kb31_extension_t {
         retval.value[2].val = x2;
         retval.value[3].val = x3;
         return retval;
+#endif
     }
 };

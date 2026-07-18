@@ -258,12 +258,35 @@ __global__ void fixAndSumCircuitLayer(
         // Process one fixLastVariable. Since height is always even, this is guaranteed to not
         // require any padding checks.
         size_t firstIdx = i << 1;
+        const size_t firstZeroIdx = firstIdx << 1;
+        const CircuitValues foldedFirst = CircuitValues::fix_last_variable(
+            CircuitValues::load(
+                inputJaggedMle.denseData.layer,
+                firstZeroIdx,
+                inputJaggedMle.denseData.height),
+            CircuitValues::load(
+                inputJaggedMle.denseData.layer,
+                firstZeroIdx + 1,
+                inputJaggedMle.denseData.height),
+            alpha);
         inputJaggedMle.fixLastVariableUnchecked(outputJaggedMle, firstIdx, alpha);
 
         // The second fix_last_variable could by trying to process the end of the row. We are
         // guaranteed to be able to access the end of this row, but we need to make sure that the
         // next row has even length too.
         size_t secondIdx = firstIdx + 1;
+
+        const size_t secondZeroIdx = secondIdx << 1;
+        const CircuitValues foldedSecond = CircuitValues::fix_last_variable(
+            CircuitValues::load(
+                inputJaggedMle.denseData.layer,
+                secondZeroIdx,
+                inputJaggedMle.denseData.height),
+            CircuitValues::load(
+                inputJaggedMle.denseData.layer,
+                secondZeroIdx + 1,
+                inputJaggedMle.denseData.height),
+            alpha);
 
         size_t restrictedIndex =
             inputJaggedMle.fixLastVariableTwoPadding(outputJaggedMle, secondIdx, alpha);
@@ -273,14 +296,14 @@ __global__ void fixAndSumCircuitLayer(
         // Now set up the sum_as_poly.
         size_t colIdx = outputJaggedMle.colIndex[outputIndex];
         size_t startIdx = outputJaggedMle.startIndices[colIdx];
-        SumAsPolyResult result = sumAsPolyCircuitLayerInner(
-            outputJaggedMle.denseData.layer,
+        SumAsPolyResult result = sumAsPolyCircuitValues(
+            foldedFirst,
+            foldedSecond,
             colIdx,
             startIdx,
             eqRow,
             eqInteraction,
             lambda,
-            outputJaggedMle.denseData.height,
             outputIndex);
 
         evalZero += result.evalZero;
@@ -343,6 +366,8 @@ __global__ void fixAndSumLastCircuitLayer(
         CircuitValues valuesZero = CircuitValues::load(layer, zeroIdx, height * 2);
         CircuitValues valuesOne = CircuitValues::load(layer, oneIdx, height * 2);
         CircuitValues values = CircuitValues::fix_last_variable(valuesZero, valuesOne, alpha);
+        const CircuitValues foldedFirst = values;
+        CircuitValues foldedSecond = CircuitValues::paddingValues();
 
         size_t outputIndex = i << 1;
 
@@ -361,6 +386,7 @@ __global__ void fixAndSumLastCircuitLayer(
             valuesZero = CircuitValues::load(layer, zeroIdx, height * 2);
             valuesOne = CircuitValues::load(layer, oneIdx, height * 2);
             values = CircuitValues::fix_last_variable(valuesZero, valuesOne, alpha);
+            foldedSecond = values;
 
             outputIndex = (i << 1) + 1;
             // Store the restricted values
@@ -372,7 +398,7 @@ __global__ void fixAndSumLastCircuitLayer(
 
         // Now set up the sum_as_poly.
         SumAsPolyResult result =
-            sumAsPolyInteractionLayerInner(output, eqInteraction, lambda, height, i);
+            sumAsPolyInteractionValues(foldedFirst, foldedSecond, eqInteraction, lambda, i);
         evalZero += result.evalZero;
         evalHalf += result.evalHalf;
         eqSum += result.eqSum;
@@ -419,12 +445,14 @@ __global__ void fixAndSumInteractionsLayer(
 
         // Fix last variable for the actual layer. TODO: this has some padding checks that aren't
         // needed.
-        fixLastVariableInteractionsLayerInner(input, output, alpha, height, outputHeight, firstIdx);
+        const CircuitValues foldedFirst = fixLastVariableInteractionsLayerInner(
+            input, output, alpha, height, outputHeight, firstIdx);
 
         // Todo: instead of checking padding conditions twice here ad in sumAsPoly, we should do it
         // once.
+        CircuitValues foldedSecond = CircuitValues::paddingValues();
         if (secondIdx < outputHeight) {
-            fixLastVariableInteractionsLayerInner(
+            foldedSecond = fixLastVariableInteractionsLayerInner(
                 input,
                 output,
                 alpha,
@@ -434,8 +462,8 @@ __global__ void fixAndSumInteractionsLayer(
         }
 
         // Now set up the sum_as_poly. Padding is handled in here.
-        SumAsPolyResult result =
-            sumAsPolyInteractionLayerInner(output, eqInteraction, lambda, outputHeight, i);
+        SumAsPolyResult result = sumAsPolyInteractionValues(
+            foldedFirst, foldedSecond, eqInteraction, lambda, i);
 
         evalZero += result.evalZero;
         evalHalf += result.evalHalf;

@@ -11,8 +11,7 @@
 #include "config.cuh"
 #include "sum_and_reduce/reduce.cuh"
 
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
+#include "backend/cooperative_groups.cuh"
 
 namespace cg = cooperative_groups;
 

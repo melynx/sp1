@@ -37,6 +37,16 @@ impl<'a> ProveRequest<'a, EnvProver> for EnvProveRequest<'a> {
                 }
                 _ => panic!("Invalid proving key type for CUDA prover"),
             },
+            #[cfg(feature = "rocm")]
+            EnvProver::Rocm(prover) => match self.base.pk {
+                EnvProvingKey::Rocm { pk, .. } => {
+                    let mut req = prover.prove(pk, stdin);
+                    req.base.mode = mode;
+                    req.base.context_builder = context_builder;
+                    Ok(req.run()?)
+                }
+                _ => panic!("Invalid proving key type for ROCm prover"),
+            },
             EnvProver::Mock(prover) => match self.base.pk {
                 EnvProvingKey::Mock { pk, .. } => {
                     let mut req = prover.prove(pk, stdin);

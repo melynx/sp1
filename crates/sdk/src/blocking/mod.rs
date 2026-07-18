@@ -10,6 +10,8 @@ mod mock;
 #[cfg(feature = "network")]
 mod network;
 mod prover;
+#[cfg(feature = "rocm")]
+mod rocm;
 
 pub use client::ProverClient;
 pub use cpu::{builder::CpuProverBuilder, CpuProver};
@@ -21,6 +23,8 @@ pub use mock::MockProver;
 #[cfg(feature = "network")]
 pub use network::{builder::NetworkProverBuilder, NetworkProver};
 pub use prover::{ProveRequest, Prover};
+#[cfg(feature = "rocm")]
+pub use rocm::{builder::RocmProverBuilder, RocmProver};
 
 pub use crate::{utils, Elf, SP1ProofMode, SP1PublicValues, SP1Stdin};
 

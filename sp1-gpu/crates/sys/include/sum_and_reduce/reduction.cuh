@@ -1,8 +1,7 @@
 #pragma once
 
-#include <cuda/atomic>
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
+#include "backend/cooperative_groups.cuh"
+#include "backend/reduce.cuh"
 
 #include "fields/kb31_extension_t.cuh"
 #include "fields/kb31_t.cuh"
@@ -29,7 +28,7 @@ struct AddOp {
 
     template <typename TyGroup>
     __device__ __forceinline__ Ty reduce(const TyGroup& group, Ty val) {
-        return cg::reduce(group, val, cg::plus<Ty>());
+        return sp1_gpu_backend::reduce(group, val, sp1_gpu_backend::Plus<Ty>());
     }
 
     template <typename TyGroup>
@@ -75,7 +74,9 @@ partialBlockReduce(const TyBlock& block, const TyTile& tile, F val, F* shared, T
         block.sync(); // Synchronize after each step
     }
 
-    return shared[0];
+    F result = shared[0];
+    block.sync();
+    return result;
 }
 
 template <typename F, typename TyOp>
@@ -89,9 +90,17 @@ struct AddOpFinalReduce<kb31_t> {
     template <typename TyGroup>
     __device__ __forceinline__ static void
     final_block_reduction_async(const TyGroup& group, kb31_t* dst, kb31_t val) {
-        cuda::atomic_ref<kb31_t, cuda::thread_scope_block> atomic(dst[0]);
-        // reduce thread sums across the tile, add the result to the atomic
-        return cg::reduce_update_async(group, atomic, val, cg::plus<kb31_t>());
+        val = sp1_gpu_backend::reduce(group, val, sp1_gpu_backend::Plus<kb31_t>());
+        if (group.thread_rank() == 0) {
+            uint32_t old = atomicAdd(&dst[0].val, 0u);
+            uint32_t assumed;
+            do {
+                assumed = old;
+                kb31_t next(assumed);
+                next += val;
+                old = atomicCAS(&dst[0].val, assumed, next.val);
+            } while (old != assumed);
+        }
     }
 };
 
@@ -103,8 +112,8 @@ struct AddOpFinalReduce<kb31_extension_t> {
 // Split the extension into a slice of base field elements and make a separate atomic update.
 #pragma unroll
         for (int j = 0; j < kb31_extension_t::D; j++) {
-            cuda::atomic_ref<kb31_t, cuda::thread_scope_block> atomic(dst[0].value[j]);
-            cg::reduce_update_async(group, atomic, val.value[j], cg::plus<kb31_t>());
+            AddOpFinalReduce<kb31_t>::final_block_reduction_async(
+                group, &dst[0].value[j], val.value[j]);
         }
     }
 };

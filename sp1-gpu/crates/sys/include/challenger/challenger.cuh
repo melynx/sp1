@@ -46,7 +46,7 @@ class DuplexChallenger {
     }
 
   public:
-    static constexpr const size_t NUM_ELEMENTS = WIDTH + 2 * RATE;
+    static constexpr const size_t NUM_ELEMENTS = WIDTH + RATE + WIDTH;
 
     __device__ __forceinline__ kb31_t getVal(size_t idx) { return sponge_state[idx % 16]; }
 
@@ -112,12 +112,13 @@ class DuplexChallenger {
     }
 
     __device__ __forceinline__ void
-    grind(size_t bits, kb31_t* result, volatile bool* found_flag, size_t n) {
+    grind(size_t bits, kb31_t* result, volatile int* found_flag, size_t start, size_t end) {
         size_t idx = threadIdx.x + blockIdx.x * blockDim.x;
 
         size_t original_buffer_size = buffer_sizes[0];
         size_t original_output_buffer_size = buffer_sizes[1];
-        __shared__ kb31_t challenger_state[NUM_ELEMENTS];
+        __shared__ uint32_t challenger_state_words[NUM_ELEMENTS];
+        kb31_t* challenger_state = reinterpret_cast<kb31_t*>(challenger_state_words);
 
         if (threadIdx.x == 0) {
             for (size_t j = 0; j < WIDTH; j++) {
@@ -134,10 +135,18 @@ class DuplexChallenger {
         // Ensure all threads see the shared memory initialized
         __syncthreads();
 
+        __shared__ volatile int block_found;
+        if (threadIdx.x == 0) {
+            block_found = 0;
+        }
+        __syncthreads();
+
         // Local copy of challenger state for each thread in each iteration.
         kb31_t local_state[NUM_ELEMENTS];
         size_t buffer_sizes[2];
-        for (size_t i = idx; i < n && !*found_flag; i += blockDim.x * gridDim.x) {
+        for (size_t i = start + idx;
+             i < end && block_found == 0 && atomicAdd((int*)found_flag, 0) == 0;
+             i += blockDim.x * gridDim.x) {
             buffer_sizes[0] = original_buffer_size;
             buffer_sizes[1] = original_output_buffer_size;
             // Reset the local state to the shared state.
@@ -150,8 +159,9 @@ class DuplexChallenger {
             kb31_t witness = kb31_t((int)i);
             if (temp_challenger.check_witness(bits, &witness)) {
                 result[0] = witness;
-                atomicExch((int*)found_flag, 1);
                 __threadfence();
+                block_found = 1;
+                atomicExch((int*)found_flag, 1);
                 return;
             }
         }
@@ -289,7 +299,7 @@ class MultiField32Challenger {
     }
 
     __device__ __forceinline__ void
-    grind(size_t bits, kb31_t* result, volatile bool* found_flag, size_t n) {
+    grind(size_t bits, kb31_t* result, volatile int* found_flag, size_t start, size_t end) {
         size_t idx = threadIdx.x + blockIdx.x * blockDim.x;
 
         size_t original_buffer_sizes[NUM_BUFFER_SIZES];
@@ -298,8 +308,10 @@ class MultiField32Challenger {
         }
 
         __shared__ bn254_t shared_sponge_state[WIDTH];
-        __shared__ kb31_t shared_input_buffer[INPUT_BUFFER_SIZE];
-        __shared__ kb31_t shared_output_buffer[OUTPUT_BUFFER_SIZE];
+        __shared__ uint32_t shared_input_buffer_words[INPUT_BUFFER_SIZE];
+        __shared__ uint32_t shared_output_buffer_words[OUTPUT_BUFFER_SIZE];
+        kb31_t* shared_input_buffer = reinterpret_cast<kb31_t*>(shared_input_buffer_words);
+        kb31_t* shared_output_buffer = reinterpret_cast<kb31_t*>(shared_output_buffer_words);
 
         if (threadIdx.x == 0) {
             for (size_t j = 0; j < WIDTH; j++) {
@@ -316,13 +328,21 @@ class MultiField32Challenger {
         // Ensure all threads see the shared memory initialized
         __syncthreads();
 
+        __shared__ volatile int block_found;
+        if (threadIdx.x == 0) {
+            block_found = 0;
+        }
+        __syncthreads();
+
         // Local copy of challenger state for each thread in each iteration.
         bn254_t local_sponge_state[WIDTH];
         kb31_t local_input_buffer[INPUT_BUFFER_SIZE];
         kb31_t local_output_buffer[OUTPUT_BUFFER_SIZE];
         size_t local_buffer_sizes[NUM_BUFFER_SIZES];
 
-        for (size_t i = idx; i < n && !*found_flag; i += blockDim.x * gridDim.x) {
+        for (size_t i = start + idx;
+             i < end && block_found == 0 && atomicAdd((int*)found_flag, 0) == 0;
+             i += blockDim.x * gridDim.x) {
             // Reset local state from shared memory.
             for (size_t j = 0; j < NUM_BUFFER_SIZES; j++) {
                 local_buffer_sizes[j] = original_buffer_sizes[j];
@@ -343,8 +363,9 @@ class MultiField32Challenger {
             kb31_t witness = kb31_t((int)i);
             if (temp_challenger.check_witness(bits, &witness)) {
                 result[0] = witness;
-                atomicExch((int*)found_flag, 1);
                 __threadfence();
+                block_found = 1;
+                atomicExch((int*)found_flag, 1);
                 return;
             }
         }

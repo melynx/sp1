@@ -64,7 +64,7 @@ struct JaggedSumcheckData {
 
     // Fixes last variable with no concern for padding, since the inputs are guaranteed to be
     // multiples of 16.
-    __forceinline__ __device__ void fixLastVariable(
+    __forceinline__ __device__ Pair fixLastVariable(
         Hadamard* output,
         size_t restrictedIdx,
         size_t baseZeroIdx,
@@ -89,5 +89,6 @@ struct JaggedSumcheckData {
 
         output->p[restrictedIdx] = value_p;
         output->q[restrictedIdx] = value_q;
+        return Pair{value_p, value_q};
     }
 };

@@ -3,10 +3,10 @@
 #include "fields/kb31_t.cuh"
 // #include <cstdio>
 
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(SP1_GPU_BACKEND_ROCM)
 #define FUN __host__ __device__
 #endif
-#ifndef __CUDA_ARCH__
+#if !defined(__CUDA_ARCH__) && !defined(SP1_GPU_BACKEND_ROCM)
 #define FUN inline
 #endif
 

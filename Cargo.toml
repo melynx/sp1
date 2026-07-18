@@ -19,6 +19,7 @@ members = [
   "crates/core/runner",
   "crates/core/runner-binary",
   "crates/cuda",
+  "crates/rocm",
   "crates/curves",
   "crates/derive",
   "crates/helper",
@@ -125,6 +126,7 @@ sp1-core-executor-runner = { version = "6.3.1", path = "crates/core/runner" }
 sp1-core-executor-runner-binary = { version = "6.3.1", path = "crates/core/runner-binary" }
 sp1-core-machine = { version = "6.3.1", path = "crates/core/machine" }
 sp1-cuda = { version = "6.3.1", path = "crates/cuda" }
+sp1-rocm = { version = "6.3.1", path = "crates/rocm" }
 sp1-curves = { version = "6.3.1", path = "crates/curves" }
 sp1-derive = { version = "6.3.1", path = "crates/derive" }
 # sp1-eval = { version = "6.3.1", path = "crates/eval" }
@@ -146,25 +148,25 @@ sp1-zkvm = { version = "6.3.1", path = "crates/zkvm/entrypoint", default-feature
 test-artifacts = { path = "crates/test-artifacts" }
 
 # sp1-gpu crates
-sp1-gpu-air = { version = "6.3.1", path = "sp1-gpu/crates/air" }
-sp1-gpu-basefold = { version = "6.3.1", path = "sp1-gpu/crates/basefold" }
-sp1-gpu-challenger = { version = "6.3.1", path = "sp1-gpu/crates/challenger" }
-sp1-gpu-commit = { version = "6.3.1", path = "sp1-gpu/crates/commit" }
-sp1-gpu-cudart = { version = "6.3.1", path = "sp1-gpu/crates/cuda" }
-sp1-gpu-jagged-assist = { version = "6.3.1", path = "sp1-gpu/crates/jagged_assist" }
-sp1-gpu-jagged-sumcheck = { version = "6.3.1", path = "sp1-gpu/crates/jagged_sumcheck" }
-sp1-gpu-jagged-tracegen = { version = "6.3.1", path = "sp1-gpu/crates/jagged_tracegen" }
-sp1-gpu-logup-gkr = { version = "6.3.1", path = "sp1-gpu/crates/logup_gkr" }
-sp1-gpu-merkle-tree = { version = "6.3.1", path = "sp1-gpu/crates/merkle_tree" }
-sp1-gpu-perf = { version = "6.3.1", path = "sp1-gpu/crates/perf" }
-sp1-gpu-prover = { version = "6.3.1", path = "sp1-gpu/crates/prover_components" }
-sp1-gpu-server = { version = "6.3.1", path = "sp1-gpu/crates/server" }
-sp1-gpu-shard-prover = { version = "6.3.1", path = "sp1-gpu/crates/shard_prover" }
-sp1-gpu-sys = { version = "6.3.1", path = "sp1-gpu/crates/sys" }
-sp1-gpu-tracegen = { version = "6.3.1", path = "sp1-gpu/crates/tracegen" }
-sp1-gpu-tracing = { version = "6.3.1", path = "sp1-gpu/crates/tracing" }
-sp1-gpu-utils = { version = "6.3.1", path = "sp1-gpu/crates/utils" }
-sp1-gpu-zerocheck = { version = "6.3.1", path = "sp1-gpu/crates/zerocheck" }
+sp1-gpu-air = { version = "6.3.1", path = "sp1-gpu/crates/air", default-features = false }
+sp1-gpu-basefold = { version = "6.3.1", path = "sp1-gpu/crates/basefold", default-features = false }
+sp1-gpu-challenger = { version = "6.3.1", path = "sp1-gpu/crates/challenger", default-features = false }
+sp1-gpu-commit = { version = "6.3.1", path = "sp1-gpu/crates/commit", default-features = false }
+sp1-gpu-cudart = { version = "6.3.1", path = "sp1-gpu/crates/cuda", default-features = false }
+sp1-gpu-jagged-assist = { version = "6.3.1", path = "sp1-gpu/crates/jagged_assist", default-features = false }
+sp1-gpu-jagged-sumcheck = { version = "6.3.1", path = "sp1-gpu/crates/jagged_sumcheck", default-features = false }
+sp1-gpu-jagged-tracegen = { version = "6.3.1", path = "sp1-gpu/crates/jagged_tracegen", default-features = false }
+sp1-gpu-logup-gkr = { version = "6.3.1", path = "sp1-gpu/crates/logup_gkr", default-features = false }
+sp1-gpu-merkle-tree = { version = "6.3.1", path = "sp1-gpu/crates/merkle_tree", default-features = false }
+sp1-gpu-perf = { version = "6.3.1", path = "sp1-gpu/crates/perf", default-features = false }
+sp1-gpu-prover = { version = "6.3.1", path = "sp1-gpu/crates/prover_components", default-features = false }
+sp1-gpu-server = { version = "6.3.1", path = "sp1-gpu/crates/server", default-features = false }
+sp1-gpu-shard-prover = { version = "6.3.1", path = "sp1-gpu/crates/shard_prover", default-features = false }
+sp1-gpu-sys = { version = "6.3.1", path = "sp1-gpu/crates/sys", default-features = false }
+sp1-gpu-tracegen = { version = "6.3.1", path = "sp1-gpu/crates/tracegen", default-features = false }
+sp1-gpu-tracing = { version = "6.3.1", path = "sp1-gpu/crates/tracing", default-features = false }
+sp1-gpu-utils = { version = "6.3.1", path = "sp1-gpu/crates/utils", default-features = false }
+sp1-gpu-zerocheck = { version = "6.3.1", path = "sp1-gpu/crates/zerocheck", default-features = false }
 
 p3-air = "=0.4.3-succinct"
 p3-baby-bear = "=0.4.3-succinct"

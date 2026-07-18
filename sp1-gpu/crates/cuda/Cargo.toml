@@ -9,7 +9,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-sp1-gpu-sys = { workspace = true }
+sp1-gpu-sys = { workspace = true, default-features = false }
 slop-alloc = { workspace = true }
 slop-algebra = { workspace = true }
 slop-koala-bear = { workspace = true }
@@ -34,6 +34,11 @@ itertools = { workspace = true }
 tracing = { workspace = true }
 [dev-dependencies]
 rand = "0.8"
+
+[features]
+default = ["cuda"]
+cuda = ["sp1-gpu-sys/cuda"]
+rocm = ["sp1-gpu-sys/rocm"]
 
 
 [lints]

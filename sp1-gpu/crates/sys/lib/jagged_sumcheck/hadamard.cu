@@ -8,10 +8,21 @@
 #include "config.cuh"
 #include "jagged_sumcheck/hadamard.cuh"
 
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
+#include "backend/cooperative_groups.cuh"
 
 namespace cg = cooperative_groups;
+
+template <typename T, typename Group>
+__device__ __forceinline__ T shfl_value(const Group& group, T value, int src_rank) {
+    T next;
+    auto next_words = reinterpret_cast<unsigned int*>(&next);
+    auto value_words = reinterpret_cast<unsigned int*>(&value);
+#pragma unroll
+    for (unsigned int i = 0; i < sizeof(T) / sizeof(unsigned int); ++i) {
+        next_words[i] = group.shfl(value_words[i], src_rank);
+    }
+    return next;
+}
 
 template <typename F, typename EF>
 __global__ void hadamardSumAsPoly(
@@ -105,8 +116,8 @@ __global__ void hadamardFixLastVariableAndSumAsPoly(
         EF extValue = alpha * extOneValue + (EF::one() - alpha) * extZeroValue;
         EF::store(ext_output, i, extValue);
 
-        EF prevBaseValue = tile.shfl(baseValue, 0);
-        EF prevExtValue = tile.shfl(extValue, 0);
+        EF prevBaseValue = shfl_value(tile, baseValue, 0);
+        EF prevExtValue = shfl_value(tile, extValue, 0);
 
         bool amEven = (tile.thread_rank() & 1) == 0;
         if (amEven) {

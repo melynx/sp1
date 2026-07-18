@@ -1,8 +1,7 @@
 #include "config.cuh"
 #include "sum_and_reduce/reduce.cuh"
 
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
+#include "backend/cooperative_groups.cuh"
 
 namespace cg = cooperative_groups;
 
@@ -56,15 +55,16 @@ extern "C" void* reduce_kernel_ext() { return reinterpret_cast<void*>(reduceKern
 //
 // Used by `examples/partial_block_reduce_test.rs` to exercise non-power-of-2
 // warp counts (e.g. 96 threads = 3 warps, 160 = 5, 224 = 7, 288 = 9).
-__global__ void partialBlockReduceTestKernel(const felt_t* input, felt_t* output, uint32_t len) {
+template <typename F>
+__global__ void partialBlockReduceTestKernel(const F* input, F* output, uint32_t len) {
     auto block = cg::this_thread_block();
     auto tile = cg::tiled_partition<32>(block);
 
     extern __shared__ unsigned char memory[];
-    felt_t* shared = reinterpret_cast<felt_t*>(memory);
+    F* shared = reinterpret_cast<F*>(memory);
 
-    felt_t val = (threadIdx.x < len) ? input[threadIdx.x] : felt_t::zero();
-    felt_t block_sum = partialBlockReduce(block, tile, val, shared);
+    F val = (threadIdx.x < len) ? input[threadIdx.x] : F::zero();
+    F block_sum = partialBlockReduce(block, tile, val, shared);
 
     if (threadIdx.x == 0) {
         output[0] = block_sum;
@@ -72,5 +72,9 @@ __global__ void partialBlockReduceTestKernel(const felt_t* input, felt_t* output
 }
 
 extern "C" void* partial_block_reduce_test_kernel_felt() {
-    return reinterpret_cast<void*>(partialBlockReduceTestKernel);
+    return reinterpret_cast<void*>(partialBlockReduceTestKernel<felt_t>);
+}
+
+extern "C" void* partial_block_reduce_test_kernel_ext() {
+    return reinterpret_cast<void*>(partialBlockReduceTestKernel<ext_t>);
 }

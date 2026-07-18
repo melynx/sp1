@@ -194,6 +194,12 @@ public:
         const fr_t* roots = inverse ? inverse_roots_of_unity
                                     : forward_roots_of_unity;
 
+        cudaStream_t parameter_stream = nullptr;
+#if defined(SP1_GPU_BACKEND_ROCM)
+        CUDA_UNWRAP_SPPARK(
+            cudaStreamCreateWithFlags(&parameter_stream, cudaStreamNonBlocking));
+#endif
+
         const size_t blob_sz = 64 + 128 + 256 + 512 + 32;
 
         fr_t* radix6_twiddles;
@@ -211,17 +217,18 @@ public:
         twiddles[4] = twiddles[3] + 256;    /* radix10_twiddles */
 
 
-        generate_all_twiddles<<<blob_sz/32, 32>>>(blob,
+        generate_all_twiddles<<<blob_sz/32, 32, 0, parameter_stream>>>(blob,
                                                           roots[6],
                                                           roots[7],
                                                           roots[8],
                                                           roots[9],
                                                           roots[10]);
+        CUDA_UNWRAP_SPPARK(cudaGetLastError());
 
         /* copy to the constant segment */
-        CUDA_UNWRAP_SPPARK(cudaMemcpy(radix6_twiddles, twiddles[4] + 512,
-                                32 * sizeof(fr_t), cudaMemcpyDeviceToDevice
-                                ));
+        CUDA_UNWRAP_SPPARK(cudaMemcpyAsync(radix6_twiddles, twiddles[4] + 512,
+                                           32 * sizeof(fr_t), cudaMemcpyDeviceToDevice,
+                                           parameter_stream));
 
 #if !defined(FEATURE_KOALA_BEAR) && !defined(FEATURE_GOLDILOCKS)
         radix6_twiddles_6 = twiddles_X(64, 64, roots[12]);
@@ -237,14 +244,18 @@ public:
 
         partial_group_gen_powers = &partial_twiddles[WINDOW_NUM];
 
-        generate_partial_twiddles<<<WINDOW_SIZE/32, 32>>>
+        generate_partial_twiddles<<<WINDOW_SIZE/32, 32, 0, parameter_stream>>>
             (partial_twiddles, roots[MAX_LG_DOMAIN_SIZE]);
         CUDA_UNWRAP_SPPARK(cudaGetLastError());
 
-        generate_partial_twiddles<<<WINDOW_SIZE/32, 32>>>
+        generate_partial_twiddles<<<WINDOW_SIZE/32, 32, 0, parameter_stream>>>
             (partial_group_gen_powers, inverse ? group_gen_inverse 
                                                : group_gen);
         CUDA_UNWRAP_SPPARK(cudaGetLastError());
+        CUDA_UNWRAP_SPPARK(cudaStreamSynchronize(parameter_stream));
+#if defined(SP1_GPU_BACKEND_ROCM)
+        CUDA_UNWRAP_SPPARK(cudaStreamDestroy(parameter_stream));
+#endif
     }
     NTTParameters(const NTTParameters&) = delete;
     NTTParameters(NTTParameters&&) = default;

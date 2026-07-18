@@ -1,5 +1,3 @@
-#include <cuda_runtime.h>
-
 #include "runtime/exception.cuh"
 #include <cstdint>
 

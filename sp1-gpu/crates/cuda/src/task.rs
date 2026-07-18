@@ -28,7 +28,7 @@ use sp1_gpu_sys::runtime::{
 use thiserror::Error;
 use tokio::{sync::oneshot, task::JoinHandle};
 
-use crate::{DeviceCopy, ToDevice};
+use crate::{DeviceCopy, ProofArena, RocmAllocator, TaskSubArena, ToDevice};
 
 use super::{
     stream::{StreamRef, INTERVAL_MS},
@@ -114,6 +114,15 @@ where
 {
     let pool = global_task_pool();
     pool.run(f).await
+}
+
+/// Run one proof with its own device-memory arena when selected for ROCm.
+pub async fn run_proof_in_place<F, Fut, R>(f: F) -> TaskHandle<R>
+where
+    F: FnOnce(TaskScope) -> Fut,
+    Fut: Future<Output = R>,
+{
+    global_task_pool().run_proof(f).await
 }
 
 /// Run a task on the task pool.
@@ -307,6 +316,23 @@ impl TaskPool {
         task.run(f).await
     }
 
+    /// Run one proof. ROCm arena allocations share one lease for this call.
+    pub async fn run_proof<F, Fut, R>(&self, f: F) -> TaskHandle<R>
+    where
+        F: FnOnce(TaskScope) -> Fut,
+        Fut: Future<Output = R>,
+    {
+        let task = TaskPool::task(self.inner.clone())
+            .await
+            .expect("failed to acquire a task from the pool");
+        let arena = if cfg!(feature = "rocm") && RocmAllocator::selected() == RocmAllocator::Arena {
+            Some(ProofArena::new().expect("failed to create proof arena"))
+        } else {
+            None
+        };
+        task.run_with_arena(f, arena, true).await
+    }
+
     pub fn run_sync<F, R>(&self, f: F) -> Result<R, CudaError>
     where
         F: FnOnce(TaskScope) -> R,
@@ -319,11 +345,14 @@ impl TaskPool {
 }
 
 #[derive(Debug)]
-pub struct TaskScope(Weak<OwnedTask>);
+pub struct TaskScope {
+    task: Weak<OwnedTask>,
+    sub_arena: Option<Arc<TaskSubArena>>,
+}
 
 impl Clone for TaskScope {
     fn clone(&self) -> Self {
-        TaskScope(self.0.clone())
+        Self { task: self.task.clone(), sub_arena: self.sub_arena.clone() }
     }
 }
 
@@ -332,7 +361,7 @@ impl Deref for TaskScope {
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        unsafe { &(*self.0.as_ptr()).inner }
+        unsafe { &(*self.task.as_ptr()).inner }
     }
 }
 
@@ -349,6 +378,10 @@ unsafe extern "C" fn sync_host(ptr: *mut c_void) {
 }
 
 impl TaskScope {
+    pub fn arena_id(&self) -> Option<u64> {
+        self.sub_arena.as_ref().map(|arena| arena.arena_id())
+    }
+
     /// Allocates a buffer in this scope on the device.
     ///
     /// This call is not blocking. Upon successful completion, it will return a buffer with a memory
@@ -502,11 +535,11 @@ impl TaskScope {
     }
 
     pub fn owner(&self) -> TaskPool {
-        TaskPool { inner: self.0.upgrade().unwrap().inner.owner().clone() }
+        TaskPool { inner: self.task.upgrade().unwrap().inner.owner().clone() }
     }
 
     fn owner_queue(&self) -> Arc<WorkerQueue<Task>> {
-        self.0.upgrade().unwrap().inner.owner().clone()
+        self.task.upgrade().unwrap().inner.owner().clone()
     }
 
     /// Spawns a new task from the current task pool.
@@ -543,7 +576,8 @@ impl TaskScope {
             parent.stream.record_unchecked(&task.inner.end_event)?;
             task.inner.stream.wait_unchecked(&task.inner.end_event)?
         };
-        let handle = task.run(f).await;
+        let arena = parent.sub_arena.as_ref().map(|arena| arena.proof_arena());
+        let handle = task.run_with_arena(f, arena, false).await;
         handle.join(&parent)
     }
 }
@@ -599,13 +633,23 @@ impl IntoFuture for Task {
 unsafe impl Allocator for TaskScope {
     #[inline]
     unsafe fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        self.stream.allocate(layout)
+        if cfg!(feature = "rocm") && RocmAllocator::selected() == RocmAllocator::Arena {
+            self.sub_arena
+                .as_ref()
+                .ok_or(AllocError)?
+                .allocate(layout)
+                .map(|ptr| NonNull::slice_from_raw_parts(ptr, layout.size()))
+        } else {
+            self.stream.allocate(layout)
+        }
     }
 
     #[inline]
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-        // SAFETY: the safety contract must be upheld by the caller
-        self.stream.deallocate(ptr, layout)
+        if !(cfg!(feature = "rocm") && RocmAllocator::selected() == RocmAllocator::Arena) {
+            // SAFETY: the safety contract must be upheld by the caller
+            self.stream.deallocate(ptr, layout)
+        }
     }
 }
 
@@ -682,10 +726,33 @@ impl OwnedTask {
         F: FnOnce(TaskScope) -> Fut,
         Fut: Future<Output = R>,
     {
+        self.run_with_arena(f, None, false).await
+    }
+
+    async fn run_with_arena<F, Fut, R>(
+        self,
+        f: F,
+        inherited_arena: Option<ProofArena>,
+        root_arena: bool,
+    ) -> TaskHandle<R>
+    where
+        F: FnOnce(TaskScope) -> Fut,
+        Fut: Future<Output = R>,
+    {
         let strong_ptr = Arc::new(self);
-        let scope = TaskScope(Arc::downgrade(&strong_ptr));
+        let proof_arena = inherited_arena;
+        let sub_arena = proof_arena.clone().map(|arena| Arc::new(TaskSubArena::new(arena)));
+        let scope = TaskScope { task: Arc::downgrade(&strong_ptr), sub_arena };
         let value = f(scope.clone()).await;
         unsafe { scope.stream.record_unchecked(&scope.end_event).unwrap() };
+        if root_arena {
+            if let Some(arena) = proof_arena {
+                let completion =
+                    CudaEvent::create().expect("failed to create proof completion event");
+                unsafe { scope.stream.record_unchecked(&completion).unwrap() };
+                arena.finish(completion);
+            }
+        }
         TaskHandle { task: strong_ptr, scope, value }
     }
 
@@ -693,12 +760,24 @@ impl OwnedTask {
     where
         F: FnOnce(TaskScope) -> R,
     {
-        let scope = TaskScope(Arc::downgrade(&self));
+        let proof_arena =
+            if cfg!(feature = "rocm") && RocmAllocator::selected() == RocmAllocator::Arena {
+                Some(ProofArena::new()?)
+            } else {
+                None
+            };
+        let sub_arena = proof_arena.clone().map(|arena| Arc::new(TaskSubArena::new(arena)));
+        let scope = TaskScope { task: Arc::downgrade(&self), sub_arena };
         let output = f(scope.clone());
         unsafe {
             scope.stream.record_unchecked(&scope.end_event)?;
             scope.end_event.synchronize()?;
         };
+        if let Some(arena) = proof_arena {
+            let completion = CudaEvent::create()?;
+            unsafe { scope.stream.record_unchecked(&completion)? };
+            arena.finish(completion);
+        }
         Ok(output)
     }
 }
@@ -785,7 +864,11 @@ impl<T> IntoFuture for TaskHandle<T> {
 #[cfg(test)]
 mod tests {
 
-    use crate::TaskPoolBuilder;
+    use crate::{args, sync::CudaSend, DeviceBuffer, TaskPoolBuilder};
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    use slop_algebra::{AbstractExtensionField, AbstractField};
+    use slop_alloc::mem::DeviceMemory;
+    use sp1_primitives::{SP1ExtensionField, SP1Field};
 
     #[tokio::test]
     async fn test_global_task_pool() {
@@ -823,5 +906,174 @@ mod tests {
         }
 
         assert_eq!(count, num_callers);
+    }
+
+    #[test]
+    fn test_partial_block_reduce_wave_counts() {
+        crate::run_sync_in_place(|scope| {
+            for waves in [1usize, 2, 3, 5, 7, 9] {
+                let threads = waves * 32;
+                let input = vec![SP1Field::one(); threads];
+                let input = DeviceBuffer::from_host_slice(&input, &scope).unwrap();
+                let mut output =
+                    DeviceBuffer::from_host_slice(&[SP1Field::zero()], &scope).unwrap();
+                let len = threads as u32;
+                unsafe {
+                    let args = args!(input.as_ptr(), output.as_mut_ptr(), len);
+                    scope
+                        .launch_kernel(
+                            sp1_gpu_sys::kernels::partial_block_reduce_test_kernel_felt(),
+                            (1u32, 1u32, 1u32),
+                            threads,
+                            &args,
+                            waves * std::mem::size_of::<SP1Field>(),
+                        )
+                        .unwrap();
+                }
+                scope.synchronize_blocking().unwrap();
+                assert_eq!(
+                    output.to_host().unwrap()[0],
+                    SP1Field::from_canonical_usize(threads),
+                    "failed with {waves} waves"
+                );
+
+                let input = vec![SP1ExtensionField::one(); threads];
+                let input = DeviceBuffer::from_host_slice(&input, &scope).unwrap();
+                let mut output =
+                    DeviceBuffer::from_host_slice(&[SP1ExtensionField::zero()], &scope).unwrap();
+                unsafe {
+                    let args = args!(input.as_ptr(), output.as_mut_ptr(), len);
+                    scope
+                        .launch_kernel(
+                            sp1_gpu_sys::kernels::partial_block_reduce_test_kernel_ext(),
+                            (1u32, 1u32, 1u32),
+                            threads,
+                            &args,
+                            waves * std::mem::size_of::<SP1ExtensionField>(),
+                        )
+                        .unwrap();
+                }
+                scope.synchronize_blocking().unwrap();
+                assert_eq!(
+                    output.to_host().unwrap()[0],
+                    SP1ExtensionField::from_canonical_usize(threads),
+                    "extension reduction failed with {waves} waves"
+                );
+            }
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_koala_bear_extension_multiplication() {
+        const MODULUS: u32 = 0x7f00_0001;
+        let mut rng = StdRng::seed_from_u64(0x524f_434d);
+        let mut left = Vec::with_capacity(4099);
+        let mut right = Vec::with_capacity(4099);
+
+        for _ in 0..4096 {
+            left.push(SP1ExtensionField::from_base_fn(|_| {
+                SP1Field::from_canonical_u32(rng.gen_range(0..MODULUS))
+            }));
+            right.push(SP1ExtensionField::from_base_fn(|_| {
+                SP1Field::from_canonical_u32(rng.gen_range(0..MODULUS))
+            }));
+        }
+        left.extend([
+            SP1ExtensionField::zero(),
+            SP1ExtensionField::one(),
+            SP1ExtensionField::from_base_fn(|_| SP1Field::from_canonical_u32(MODULUS - 1)),
+        ]);
+        right.extend([
+            SP1ExtensionField::from_base_fn(|_| SP1Field::from_canonical_u32(MODULUS - 1)),
+            SP1ExtensionField::one(),
+            SP1ExtensionField::from_base_fn(|i| {
+                SP1Field::from_canonical_u32(MODULUS - 1 - i as u32)
+            }),
+        ]);
+        let expected = left.iter().zip(&right).map(|(&a, &b)| a * b).collect::<Vec<_>>();
+
+        crate::run_sync_in_place(|scope| {
+            let left = DeviceBuffer::from_host_slice(&left, &scope).unwrap();
+            let right = DeviceBuffer::from_host_slice(&right, &scope).unwrap();
+            let mut output = DeviceBuffer::from_host_slice(
+                &vec![SP1ExtensionField::zero(); expected.len()],
+                &scope,
+            )
+            .unwrap();
+            let len = expected.len();
+            unsafe {
+                let args = args!(left.as_ptr(), right.as_ptr(), output.as_mut_ptr(), len);
+                scope
+                    .launch_kernel(
+                        sp1_gpu_sys::kernels::mul_koala_bear_ext_kernel(),
+                        len.div_ceil(256),
+                        256,
+                        &args,
+                        0,
+                    )
+                    .unwrap();
+            }
+            scope.synchronize_blocking().unwrap();
+            assert_eq!(output.to_host().unwrap(), expected);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_arena_preserves_device_allocation_alignment() {
+        crate::run_sync_in_place(|scope| {
+            let buffers = (1..=64)
+                .map(|size| DeviceBuffer::<u8>::with_capacity_in(size, scope.clone()))
+                .collect::<Vec<_>>();
+            for buffer in buffers {
+                assert_eq!(buffer.as_ptr() as usize % 256, 0);
+            }
+        })
+        .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "10,000-round GPU allocator stress test"]
+    async fn test_rocm_allocator_stress() {
+        let handle = crate::run_proof_in_place(|scope| async move {
+            let mut sizes = (0..10_000usize)
+                .map(|i| 256 + (i.wrapping_mul(7_919) % (32 * 1024 - 256)))
+                .collect::<Vec<_>>();
+            sizes.extend((8..=28).map(|power| 1usize << power));
+            sizes.push(258 * 1024 * 1024);
+
+            let mut buffers = Vec::with_capacity(sizes.len());
+            for (index, size) in sizes.into_iter().enumerate() {
+                let mut buffer = DeviceBuffer::<u8>::with_capacity_in(size, scope.clone());
+                let pattern = (index % 251 + 1) as u8;
+                unsafe {
+                    scope
+                        .write_bytes(buffer.as_mut_ptr(), pattern, size)
+                        .expect("failed to fill stress allocation");
+                    buffer.set_len(size);
+                }
+                buffers.push((buffer, pattern));
+            }
+
+            let buffers = scope
+                .run_in_place(|child| async move {
+                    let buffers = buffers
+                        .into_iter()
+                        .map(|(buffer, pattern)| (unsafe { buffer.send_to_scope(&child) }, pattern))
+                        .collect::<Vec<_>>();
+                    for (buffer, pattern) in &buffers {
+                        let host = buffer.to_host().expect("failed to read stress allocation");
+                        assert!(host.iter().all(|value| value == pattern));
+                    }
+                    buffers
+                })
+                .await
+                .expect("allocator stress child task failed");
+
+            assert_eq!(buffers.len(), 10_022);
+        })
+        .await;
+        handle.await.expect("allocator stress root task failed");
     }
 }

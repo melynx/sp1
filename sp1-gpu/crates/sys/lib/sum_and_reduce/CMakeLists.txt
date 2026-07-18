@@ -1,4 +1,4 @@
-add_library(sum_and_reduce_objs OBJECT
+sp1_gpu_add_object_library(sum_and_reduce_objs OBJECT
     dot.cu
     reduce.cu
     reduction.cu

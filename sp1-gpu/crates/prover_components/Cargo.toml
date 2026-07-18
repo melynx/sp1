@@ -47,7 +47,13 @@ slop-algebra = { workspace = true }
 slop-jagged = { workspace = true }
 
 [features]
-default = []
+default = ["cuda"]
+cuda = ["sp1-gpu-cudart/cuda", "sp1-gpu-challenger/cuda"]
+rocm = [
+    "sp1-gpu-cudart/rocm",
+    "sp1-gpu-challenger/rocm",
+    "sp1-gpu-shard-prover/rocm",
+]
 experimental = ["sp1-prover/experimental"]
 bigint-rug = ["sp1-core-machine/bigint-rug"]
 mprotect = [

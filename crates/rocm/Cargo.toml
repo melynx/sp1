@@ -1,0 +1,41 @@
+[package]
+name = "sp1-rocm"
+description = "ROCm integration for SP1 GPU proving"
+readme = "../../README.md"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+keywords = { workspace = true }
+categories = { workspace = true }
+rust-version = { workspace = true }
+
+[dependencies]
+sp1-core-machine = { workspace = true }
+sp1-hypercube = { workspace = true }
+sp1-prover = { workspace = true }
+sp1-primitives = { workspace = true }
+sp1-prover-types = { workspace = true }
+sp1-core-executor = { workspace = true }
+bincode = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = [
+    "fs",
+    "io-util",
+    "net",
+    "process",
+    "rt",
+    "sync",
+    "time",
+] }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls", "json"] }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+sp1-core-machine = { workspace = true }
+
+[lints]
+workspace = true

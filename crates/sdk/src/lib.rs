@@ -36,6 +36,10 @@ pub use light::LightProver;
 pub mod cuda;
 #[cfg(feature = "cuda")]
 pub use cuda::CudaProver;
+#[cfg(feature = "rocm")]
+pub mod rocm;
+#[cfg(feature = "rocm")]
+pub use rocm::RocmProver;
 pub mod env;
 
 pub mod install;

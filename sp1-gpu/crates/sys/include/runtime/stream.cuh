@@ -1,9 +1,10 @@
 #pragma once
 
+#include "backend/profiling.cuh"
 #include "runtime/exception.cuh"
-#include <nvtx3/nvToolsExt.h>
 
 extern "C" rustCudaError_t cuda_device_synchronize();
+extern "C" rustCudaError_t cuda_set_device(int32_t device);
 
 extern "C" nvtxDomainHandle_t nvtxDomainCreateARust(char* name);
 

@@ -25,6 +25,25 @@ fn koala_bear_grind_kernel() -> KernelPtr {
     unsafe { grind_koala_bear() }
 }
 
+fn is_rocm_backend() -> bool {
+    cfg!(feature = "rocm")
+}
+
+fn rocm_grind_batch_size(bits: usize) -> u64 {
+    const MIN_CANDIDATES: u64 = 1 << 14;
+    const MAX_CANDIDATES: u64 = 1 << 22;
+
+    let shifted = 1u64.checked_shl((bits.saturating_add(4)).min(22) as u32).unwrap();
+    shifted.clamp(MIN_CANDIDATES, MAX_CANDIDATES)
+}
+
+fn grind_grid_dim(candidate_count: u64, block_dim: usize) -> usize {
+    const MAX_BLOCKS: usize = 8192;
+
+    let blocks = candidate_count.div_ceil(block_dim as u64) as usize;
+    blocks.clamp(1, MAX_BLOCKS)
+}
+
 /// Grinds on device synchronously for a DuplexChallenger.
 ///
 /// This is a sync version that replaces the async `DeviceGrindingChallenger` trait.
@@ -41,36 +60,75 @@ where
     let cpu_challenger: DuplexChallenger<F, _> = challenger.clone().into();
 
     let mut result = DeviceBuffer::with_capacity_in(1, scope.clone());
-    let mut found_flag = DeviceBuffer::<bool>::with_capacity_in(1, scope.clone());
     let mut gpu_challenger = cpu_challenger.to_device_sync(scope).unwrap();
 
     let block_dim: usize = 512;
-    let grid_dim: usize = (1 << (bits.saturating_sub(SP1_PROOF_OF_WORK_BITS))).max(512);
     let n = F::ORDER_U64;
 
     unsafe {
         result.assume_init();
-        found_flag.assume_init();
-        let args = args!(
-            gpu_challenger.as_mut_raw(),
-            result.as_mut_ptr(),
-            bits,
-            n,
-            found_flag.as_mut_ptr()
-        );
-        scope.launch_kernel(grind_kernel(), (grid_dim, 1, 1), block_dim, &args, 0).unwrap();
     }
 
-    // Copy result back to host synchronously
-    let result = result.to_host().unwrap();
-    // });
+    let witness = if is_rocm_backend() {
+        let batch_size = rocm_grind_batch_size(bits);
+        let mut start = 0u64;
 
-    let witness = *result.first().unwrap();
+        loop {
+            assert!(start < n, "GPU grinding exhausted the field without finding a witness");
+
+            let end = start.saturating_add(batch_size).min(n);
+            let candidate_count = end - start;
+            let grid_dim = grind_grid_dim(candidate_count, block_dim);
+            let mut found_flag = DeviceBuffer::from_host_slice(&[0i32], scope).unwrap();
+
+            unsafe {
+                let args = args!(
+                    gpu_challenger.as_mut_raw(),
+                    result.as_mut_ptr(),
+                    bits,
+                    start,
+                    end,
+                    found_flag.as_mut_ptr()
+                );
+                scope.launch_kernel(grind_kernel(), (grid_dim, 1, 1), block_dim, &args, 0).unwrap();
+            }
+
+            scope.synchronize_blocking().unwrap();
+            if found_flag.to_host().unwrap()[0] != 0 {
+                break *result.to_host().unwrap().first().unwrap();
+            }
+
+            start = end;
+        }
+    } else {
+        let grid_dim: usize = (1 << bits.saturating_sub(SP1_PROOF_OF_WORK_BITS)).max(512);
+        let mut found_flag = DeviceBuffer::from_host_slice(&[0i32], scope).unwrap();
+
+        unsafe {
+            let args = args!(
+                gpu_challenger.as_mut_raw(),
+                result.as_mut_ptr(),
+                bits,
+                0u64,
+                n,
+                found_flag.as_mut_ptr()
+            );
+            scope.launch_kernel(grind_kernel(), (grid_dim, 1, 1), block_dim, &args, 0).unwrap();
+        }
+
+        scope.synchronize_blocking().unwrap();
+        assert!(found_flag.to_host().unwrap()[0] != 0, "GPU grinding did not find a witness");
+        *result.to_host().unwrap().first().unwrap()
+    };
 
     // Check the witness. This is necessary because it changes the internal state of the
     // challenger, and the CPU version of the challenger does this as well. It's also necessary
     // for the security of the protocol.
-    assert!(challenger.check_witness(bits, witness));
+    assert!(
+        challenger.check_witness(bits, witness),
+        "GPU grinding returned invalid witness: bits={bits}, witness={}",
+        witness.as_canonical_u64()
+    );
     witness
 }
 
@@ -102,37 +160,85 @@ where
     let cpu_challenger: MultiField32Challenger<F, PF, _> = challenger.clone().into();
 
     let mut result = DeviceBuffer::with_capacity_in(1, scope.clone());
-    let mut found_flag = DeviceBuffer::<bool>::with_capacity_in(1, scope.clone());
     let mut gpu_challenger = cpu_challenger.to_device_sync(scope).unwrap();
 
     let block_dim: usize = 512;
-    let grid_dim: usize = 1;
     let n = F::ORDER_U64;
 
     unsafe {
         result.assume_init();
-        found_flag.assume_init();
-        let args = args!(
-            gpu_challenger.as_mut_raw(),
-            result.as_mut_ptr(),
-            bits,
-            n,
-            found_flag.as_mut_ptr()
-        );
-        scope
-            .launch_kernel(multi_field32_grind_kernel(), (grid_dim, 1, 1), block_dim, &args, 0)
-            .unwrap();
     }
 
-    // Copy result back to host synchronously
-    let result = result.to_host().unwrap();
+    let witness = if is_rocm_backend() {
+        let batch_size = rocm_grind_batch_size(bits);
+        let mut start = 0u64;
 
-    let witness = *result.first().unwrap();
+        loop {
+            assert!(start < n, "GPU grinding exhausted the field without finding a witness");
+
+            let end = start.saturating_add(batch_size).min(n);
+            let candidate_count = end - start;
+            let grid_dim = grind_grid_dim(candidate_count, block_dim);
+            let mut found_flag = DeviceBuffer::from_host_slice(&[0i32], scope).unwrap();
+
+            unsafe {
+                let args = args!(
+                    gpu_challenger.as_mut_raw(),
+                    result.as_mut_ptr(),
+                    bits,
+                    start,
+                    end,
+                    found_flag.as_mut_ptr()
+                );
+                scope
+                    .launch_kernel(
+                        multi_field32_grind_kernel(),
+                        (grid_dim, 1, 1),
+                        block_dim,
+                        &args,
+                        0,
+                    )
+                    .unwrap();
+            }
+
+            scope.synchronize_blocking().unwrap();
+            if found_flag.to_host().unwrap()[0] != 0 {
+                break *result.to_host().unwrap().first().unwrap();
+            }
+
+            start = end;
+        }
+    } else {
+        let grid_dim: usize = 1;
+        let mut found_flag = DeviceBuffer::from_host_slice(&[0i32], scope).unwrap();
+
+        unsafe {
+            let args = args!(
+                gpu_challenger.as_mut_raw(),
+                result.as_mut_ptr(),
+                bits,
+                0u64,
+                n,
+                found_flag.as_mut_ptr()
+            );
+            scope
+                .launch_kernel(multi_field32_grind_kernel(), (grid_dim, 1, 1), block_dim, &args, 0)
+                .unwrap();
+        }
+
+        scope.synchronize_blocking().unwrap();
+        assert!(found_flag.to_host().unwrap()[0] != 0, "GPU grinding did not find a witness");
+        *result.to_host().unwrap().first().unwrap()
+    };
 
     // Check the witness. This is necessary because it changes the internal state of the
     // challenger, and the CPU version of the challenger does this as well. It's also necessary
     // for the security of the protocol.
-    assert!(challenger.check_witness(bits, witness));
+    assert!(
+        challenger.check_witness(bits, witness),
+        "GPU grinding returned invalid witness: bits={bits}, witness={}",
+        witness.as_canonical_u64()
+    );
     witness
 }
 

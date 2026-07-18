@@ -1,14 +1,13 @@
 use sp1_core_executor::SP1Context;
-use sp1_cuda::{
-    api::{Request, Response},
-    client::socket_path,
-};
+use sp1_cuda::api::{Request, Response};
 use sp1_gpu_cudart::TaskScope;
 use sp1_gpu_prover::cuda_worker_builder_with_machine;
 use sp1_primitives::Elf;
-use sp1_prover::worker::{SP1LocalNode, SP1LocalNodeBuilder};
+use sp1_prover::worker::SP1LocalNodeBuilder;
 use sp1_prover::SP1VerifyingKey;
+use sp1_prover_types::SerializableRiscvMachine;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use std::io;
@@ -26,13 +25,15 @@ struct CachedProgram {
 
 /// The server for the sp1-gpu service.
 pub struct Server {
-    pub cuda_device_id: u32,
+    pub device_id: u32,
+    pub socket_path: PathBuf,
+    pub backend_name: &'static str,
 }
 
 /// The context for a single connection to the server.
 struct ConnectionCtx {
     pk_cache: HashMap<[u8; 32], CachedProgram>,
-    prover: tokio::sync::OnceCell<Arc<SP1LocalNode>>,
+    machine: Option<SerializableRiscvMachine>,
     task_scope: TaskScope,
 }
 
@@ -40,11 +41,12 @@ impl Server {
     /// Run the server, indefinitely.
     pub async fn run(self, task_scope: TaskScope) {
         eprintln!(
-            "Running sp1-gpu-server {} with device {}",
+            "Running {} {} with device {}",
+            self.backend_name,
             sp1_primitives::SP1_CRATE_VERSION,
-            self.cuda_device_id
+            self.device_id
         );
-        let socket_path = socket_path(self.cuda_device_id);
+        let socket_path = self.socket_path;
 
         // Try to remove the socket file socket incase the file was never cleaned up.
         if let Err(e) = std::fs::remove_file(&socket_path) {
@@ -96,8 +98,7 @@ impl Server {
         task_scope: TaskScope,
         stream: &mut UnixStream,
     ) -> Result<(), io::Error> {
-        let mut ctx =
-            ConnectionCtx { pk_cache: Default::default(), prover: Default::default(), task_scope };
+        let mut ctx = ConnectionCtx { pk_cache: Default::default(), machine: None, task_scope };
 
         loop {
             let mut len = [0_u8; 4];
@@ -125,34 +126,27 @@ impl Server {
     async fn handle_request(ctx: &mut ConnectionCtx, request: Request) -> Response {
         match request {
             Request::Setup { elf, machine } => {
+                ctx.machine = Some(machine);
                 let elf_hash = sha256(&elf);
                 if let Some(pk) = ctx.pk_cache.get(&elf_hash) {
                     return Response::Setup { id: elf_hash, vk: pk.vk.clone() };
                 }
 
-                let task_scope = ctx.task_scope.clone();
-                let prover = match ctx
-                    .prover
-                    .get_or_try_init(|| async {
-                        let machine = machine.into();
-                        SP1LocalNodeBuilder::from_worker_client_builder(
-                            cuda_worker_builder_with_machine(task_scope, machine).await,
-                        )
+                tracing::info!("Running setup");
+                let setup_elf = elf.clone();
+                let task_pool = ctx.task_scope.owner();
+                let handle = task_pool.run_proof(|proof_scope| async move {
+                    let builder =
+                        cuda_worker_builder_with_machine(proof_scope, machine.into()).await;
+                    let prover = SP1LocalNodeBuilder::from_worker_client_builder(builder)
                         .build()
                         .await
-                        .map(Arc::new)
-                    })
-                    .await
-                {
-                    Ok(prover) => prover,
-                    Err(e) => {
-                        return Response::InternalError(format!("Failed to create prover: {e}"))
-                    }
-                };
-
-                tracing::info!("Running setup");
-                let vk = match prover.setup(&elf).await {
-                    Ok(vk) => vk,
+                        .map_err(|e| format!("Failed to create prover: {e}"))?;
+                    prover.setup(&setup_elf).await.map_err(|e| e.to_string())
+                });
+                let vk = match handle.await.await {
+                    Ok(Ok(vk)) => vk,
+                    Ok(Err(e)) => return Response::InternalError(e),
                     Err(e) => return Response::InternalError(e.to_string()),
                 };
                 let pk = CachedProgram { elf: Arc::new(Elf::Dynamic(elf.into())), vk: vk.clone() };
@@ -166,19 +160,33 @@ impl Server {
             }
             Request::ProveWithMode { mode, key, stdin, proof_nonce } => {
                 tracing::info!("Proving with mode: {mode:?}");
-                let Some(cached) = ctx.pk_cache.get(&key) else {
+                let Some(cached) = ctx.pk_cache.get(&key).cloned() else {
                     return Response::InternalError(
                         "Missing proving key, do not drop the prover while maintaing a proving key generated by it.".to_string(),
                     );
                 };
-                let Some(prover) = ctx.prover.get() else {
+                let Some(machine) = ctx.machine else {
                     return Response::InternalError(
                         "Prover not initialized, call Setup first.".to_string(),
                     );
                 };
                 let context = SP1Context::builder().proof_nonce(proof_nonce).build();
-                match prover.prove_with_mode(&cached.elf, stdin, context, mode).await {
-                    Ok(proof) => Response::Proof { proof },
+                let task_pool = ctx.task_scope.owner();
+                let handle = task_pool.run_proof(|proof_scope| async move {
+                    let builder =
+                        cuda_worker_builder_with_machine(proof_scope, machine.into()).await;
+                    let prover = SP1LocalNodeBuilder::from_worker_client_builder(builder)
+                        .build()
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    prover
+                        .prove_with_mode(&cached.elf, stdin, context, mode)
+                        .await
+                        .map_err(|e| e.to_string())
+                });
+                match handle.await.await {
+                    Ok(Ok(proof)) => Response::Proof { proof },
+                    Ok(Err(e)) => Response::ProverError(e),
                     Err(e) => Response::ProverError(e.to_string()),
                 }
             }

@@ -3,6 +3,9 @@ use std::ffi::c_void;
 use crate::runtime::{CudaRustError, CudaStreamHandle, KernelPtr};
 
 extern "C" {
+    // Focused arithmetic test kernels.
+    pub fn mul_koala_bear_ext_kernel() -> KernelPtr;
+
     // Sum kernels
     pub fn sum_kernel_u32() -> KernelPtr;
     pub fn sum_kernel_felt() -> KernelPtr;
@@ -18,6 +21,8 @@ extern "C" {
     // Reduce kernels
     pub fn reduce_kernel_felt() -> KernelPtr;
     pub fn reduce_kernel_ext() -> KernelPtr;
+    pub fn partial_block_reduce_test_kernel_felt() -> KernelPtr;
+    pub fn partial_block_reduce_test_kernel_ext() -> KernelPtr;
 
     // JaggedMLE kernels
     pub fn jagged_eval_kernel_chunked_felt() -> KernelPtr;

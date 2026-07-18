@@ -34,12 +34,37 @@ __global__ void fixAndSumFirstCircuitLayer(
         // Process one fixLastVariable. Since height is always even, this is guaranteed to not
         // require any padding checks.
         size_t firstIdx = i << 1;
+        const FirstLayerCircuitValues firstZero = FirstLayerCircuitValues::load(
+            inputJaggedMle.denseData.numeratorValues,
+            inputJaggedMle.denseData.denominatorValues,
+            firstIdx << 1,
+            inputJaggedMle.denseData.height);
+        const FirstLayerCircuitValues firstOne = FirstLayerCircuitValues::load(
+            inputJaggedMle.denseData.numeratorValues,
+            inputJaggedMle.denseData.denominatorValues,
+            (firstIdx << 1) + 1,
+            inputJaggedMle.denseData.height);
+        const CircuitValues foldedFirst =
+            FirstLayerCircuitValues::fix_last_variable(firstZero, firstOne, alpha);
         inputJaggedMle.fixLastVariableUnchecked(outputJaggedMle, firstIdx, alpha);
 
         // The second fix_last_variable could by trying to process the end of the row. We are
         // guaranteed to be able to access the end of this row, but we need to make sure that the
         // next row has even length too.
         size_t secondIdx = firstIdx + 1;
+
+        const FirstLayerCircuitValues secondZero = FirstLayerCircuitValues::load(
+            inputJaggedMle.denseData.numeratorValues,
+            inputJaggedMle.denseData.denominatorValues,
+            secondIdx << 1,
+            inputJaggedMle.denseData.height);
+        const FirstLayerCircuitValues secondOne = FirstLayerCircuitValues::load(
+            inputJaggedMle.denseData.numeratorValues,
+            inputJaggedMle.denseData.denominatorValues,
+            (secondIdx << 1) + 1,
+            inputJaggedMle.denseData.height);
+        const CircuitValues foldedSecond =
+            FirstLayerCircuitValues::fix_last_variable(secondZero, secondOne, alpha);
 
         size_t restrictedIndex =
             inputJaggedMle.fixLastVariableTwoPadding(outputJaggedMle, secondIdx, alpha);
@@ -49,14 +74,14 @@ __global__ void fixAndSumFirstCircuitLayer(
         // Now set up the sum_as_poly.
         size_t colIdx = outputJaggedMle.colIndex[outputIndex];
         size_t startIdx = outputJaggedMle.startIndices[colIdx];
-        SumAsPolyResult result = sumAsPolyCircuitLayerInner(
-            outputJaggedMle.denseData.layer,
+        SumAsPolyResult result = sumAsPolyCircuitValues(
+            foldedFirst,
+            foldedSecond,
             colIdx,
             startIdx,
             eqRow,
             eqInteraction,
             lambda,
-            outputJaggedMle.denseData.height,
             outputIndex);
 
         evalZero += result.evalZero;

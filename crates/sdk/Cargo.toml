@@ -27,6 +27,7 @@ sp1-prover = { workspace = true }
 sp1-verifier = { workspace = true }
 sp1-core-machine = { workspace = true }
 sp1-cuda = { workspace = true, optional = true }
+sp1-rocm = { workspace = true, optional = true }
 sp1-build = { workspace = true }
 futures = { workspace = true }
 bincode = { workspace = true }
@@ -111,6 +112,7 @@ network = [
 tee-2fa = []
 reserved-capacity = ["network"]
 cuda = ["dep:sp1-cuda"]
+rocm = ["dep:sp1-rocm"]
 bigint-rug = ["sp1-core-machine/bigint-rug"]
 experimental = ["sp1-prover/experimental"]
 mprotect = [

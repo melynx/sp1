@@ -5,6 +5,8 @@ use crate::{ProvingKey, SP1ProvingKey};
 use sp1_cuda::CudaProvingKey;
 use sp1_primitives::Elf;
 use sp1_prover::SP1VerifyingKey;
+#[cfg(feature = "rocm")]
+use sp1_rocm::RocmProvingKey;
 
 #[derive(Clone)]
 pub enum EnvProvingKey {
@@ -15,6 +17,11 @@ pub enum EnvProvingKey {
     #[cfg(feature = "cuda")]
     Cuda {
         pk: CudaProvingKey,
+        seal: sealed::Seal,
+    },
+    #[cfg(feature = "rocm")]
+    Rocm {
+        pk: RocmProvingKey,
         seal: sealed::Seal,
     },
     Mock {
@@ -42,6 +49,11 @@ impl EnvProvingKey {
         Self::Cuda { pk: inner, seal: sealed::Seal::new() }
     }
 
+    #[cfg(feature = "rocm")]
+    pub(crate) const fn rocm(inner: RocmProvingKey) -> Self {
+        Self::Rocm { pk: inner, seal: sealed::Seal::new() }
+    }
+
     pub(crate) const fn mock(inner: SP1ProvingKey) -> Self {
         Self::Mock { pk: inner, seal: sealed::Seal::new() }
     }
@@ -63,6 +75,8 @@ impl ProvingKey for EnvProvingKey {
             Self::Cpu { pk, .. } => pk.verifying_key(),
             #[cfg(feature = "cuda")]
             Self::Cuda { pk, .. } => pk.verifying_key(),
+            #[cfg(feature = "rocm")]
+            Self::Rocm { pk, .. } => pk.verifying_key(),
             Self::Mock { pk, .. } => pk.verifying_key(),
             Self::Light { pk, .. } => pk.verifying_key(),
             #[cfg(feature = "network")]
@@ -76,6 +90,8 @@ impl ProvingKey for EnvProvingKey {
             Self::Cpu { pk, .. } => pk.elf(),
             #[cfg(feature = "cuda")]
             Self::Cuda { pk, .. } => pk.elf(),
+            #[cfg(feature = "rocm")]
+            Self::Rocm { pk, .. } => pk.elf(),
             Self::Mock { pk, .. } => pk.elf(),
             Self::Light { pk, .. } => pk.elf(),
             #[cfg(feature = "network")]

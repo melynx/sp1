@@ -15,6 +15,7 @@
 // waiting.
 
 #include "jagged_assist/fold_metadata.cuh"
+#include "backend/runtime_api.cuh"
 #include <cstdint>
 
 namespace {
@@ -94,12 +95,11 @@ __global__ void jaggedFoldMetadata(
     // proceed.
     __shared__ uint32_t previous_sum;
     if (tid == 0) {
-        while (atomicAdd(&flags[bid], 0u) == 0u) {
+        while (sp1_device_load_acquire(&flags[bid]) == 0u) {
         }
         previous_sum = scan_values[bid];
         scan_values[bid + 1u] = aux[SECTION_SIZE - 1u] + previous_sum;
-        __threadfence();
-        atomicAdd(&flags[bid + 1u], 1u);
+        sp1_device_store_release(&flags[bid + 1u], 1u);
     }
     __syncthreads();
 

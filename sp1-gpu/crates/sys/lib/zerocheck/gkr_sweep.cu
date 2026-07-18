@@ -8,8 +8,8 @@
 #include "config.cuh"
 #include "sum_and_reduce/reduce.cuh"
 
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
+#include "backend/cooperative_groups.cuh"
+#include "backend/reduce.cuh"
 
 namespace cg = cooperative_groups;
 
@@ -113,7 +113,8 @@ __global__ void zerocheck_gkr_sweep(
                 K v = interp_load(trace_data, lay.preprocessed_ptr, col, lay.height, row_idx, e);
                 lane_sum += ext_t::load(gkr_powers, gkr.main_width + col) * v;
             }
-            ext_t row_total = cg::reduce(warp, lane_sum, cg::plus<ext_t>());
+            ext_t row_total = sp1_gpu_backend::reduce(
+                warp, lane_sum, sp1_gpu_backend::Plus<ext_t>());
             if (lane == 0 && row_idx < row_limit) {
                 ext_t eq = ext_t::load(partial_lagrange, row_idx);
                 thread_acc += row_total * (eq * lambda);

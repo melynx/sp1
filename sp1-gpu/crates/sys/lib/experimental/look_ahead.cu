@@ -2,9 +2,8 @@
 
 #include "config.cuh"
 
-#include <cuda/pipeline>
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
+#include "backend/cooperative_groups.cuh"
+#include "backend/reduce.cuh"
 #include <cstdint>
 
 namespace cg = cooperative_groups;
@@ -156,8 +155,8 @@ __global__ void roundKernel(
                 q_red = ext_t::zero();
                 p_red = ext_t::zero();
             }
-            p_red = cg::reduce(fix_last_tile, p_red, cg::plus<ext_t>());
-            q_red = cg::reduce(fix_last_tile, q_red, cg::plus<ext_t>());
+            p_red = sp1_gpu_backend::reduce(fix_last_tile, p_red, sp1_gpu_backend::Plus<ext_t>());
+            q_red = sp1_gpu_backend::reduce(fix_last_tile, q_red, sp1_gpu_backend::Plus<ext_t>());
 
             if (fix_last_tile.thread_rank() == 0) {
                 // Store the reduced values in global memory for caching the results of fixing the
@@ -200,8 +199,8 @@ __global__ void roundKernel(
                     q_smem[base] *
                     evalEq<NUM_POINTS, SUM_GROUP>[point][sum_as_poly_tile.thread_rank()];
 
-                p_interp = cg::reduce(sum_as_poly_tile, p_interp, cg::plus<ext_t>());
-                q_interp = cg::reduce(sum_as_poly_tile, q_interp, cg::plus<ext_t>());
+                p_interp = sp1_gpu_backend::reduce(sum_as_poly_tile, p_interp, sp1_gpu_backend::Plus<ext_t>());
+                q_interp = sp1_gpu_backend::reduce(sum_as_poly_tile, q_interp, sp1_gpu_backend::Plus<ext_t>());
 
                 // Get the reduction result to the warp offset warp_tile from leader warp of
                 // the sum_as_poly_tile group, but only for that specifc thread, we don't want
@@ -212,7 +211,7 @@ __global__ void roundKernel(
                 }
             }
             ext_t hadamard = p_local * q_local;
-            hadamard = cg::reduce(warp, hadamard, cg::plus<ext_t>());
+            hadamard = sp1_gpu_backend::reduce(warp, hadamard, sp1_gpu_backend::Plus<ext_t>());
             if (warp.thread_rank() == 0) {
                 result_smem[warp.meta_group_size() * point + warp.meta_group_rank()] += hadamard;
             }

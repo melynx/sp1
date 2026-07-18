@@ -1,9 +1,6 @@
 // CUDA runtime bindings.
 
-#include <cuda.h>
-#include <nvtx3/nvToolsExt.h>
-#include <cuda_runtime.h>
-
+#include "backend/profiling.cuh"
 #include "runtime/exception.cuh"
 
 // Create an nvtx domain.
@@ -26,6 +23,11 @@ extern "C" void nvtx_range_end(uint64_t id) { nvtxRangeEnd(id); }
 
 extern "C" rustCudaError_t cuda_device_synchronize() {
     CUDA_OK(cudaDeviceSynchronize());
+    return CUDA_SUCCESS_CSL;
+}
+
+extern "C" rustCudaError_t cuda_set_device(int32_t device) {
+    CUDA_OK(cudaSetDevice(device));
     return CUDA_SUCCESS_CSL;
 }
 
@@ -154,5 +156,6 @@ extern "C" rustCudaError_t cuda_launch_kernel(
     size_t shared_mem,
     cudaStream_t stream) {
     CUDA_OK(cudaLaunchKernel(kernel, grid, block, args, shared_mem, stream));
+    CUDA_OK(cudaGetLastError());
     return CUDA_SUCCESS_CSL;
 }

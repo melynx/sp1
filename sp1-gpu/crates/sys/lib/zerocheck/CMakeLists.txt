@@ -1,4 +1,4 @@
-add_library(zerocheck_objs OBJECT
+sp1_gpu_add_object_library(zerocheck_objs OBJECT
     jagged_mle.cu
     sequential.cu
     column_tile.cu

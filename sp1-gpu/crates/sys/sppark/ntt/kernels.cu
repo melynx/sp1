@@ -5,7 +5,7 @@
 #ifndef __NTT_KERNELS_CU__
 #define __NTT_KERNELS_CU__
 
-#include <cooperative_groups.h>
+#include "backend/cooperative_groups.cuh"
 
 template<typename T>
 __device__ __forceinline__

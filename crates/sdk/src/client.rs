@@ -14,6 +14,9 @@ use crate::{
 #[cfg(feature = "cuda")]
 use crate::cuda::builder::CudaProverBuilder;
 
+#[cfg(feature = "rocm")]
+use crate::rocm::builder::RocmProverBuilder;
+
 #[cfg(feature = "network")]
 use crate::network::{builder::NetworkProverBuilder, NetworkMode};
 
@@ -122,6 +125,27 @@ impl ProverClientBuilder {
     #[must_use]
     pub fn cuda(&self) -> CudaProverBuilder {
         CudaProverBuilder::new_with_machine(self.machine.clone())
+    }
+
+    /// Builds a [`RocmProver`](crate::RocmProver) specifically for local proving on AMD GPUs.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use sp1_sdk::{Elf, ProveRequest, Prover, ProverClient, SP1Stdin};
+    ///
+    /// tokio_test::block_on(async {
+    ///     let elf = Elf::Static(&[1, 2, 3]);
+    ///     let stdin = SP1Stdin::new();
+    ///
+    ///     let prover = ProverClient::builder().rocm().build().await;
+    ///     let pk = prover.setup(elf).await.unwrap();
+    ///     let proof = prover.prove(&pk, stdin).compressed().await.unwrap();
+    /// });
+    /// ```
+    #[cfg(feature = "rocm")]
+    #[must_use]
+    pub fn rocm(&self) -> RocmProverBuilder {
+        RocmProverBuilder::new_with_machine(self.machine.clone())
     }
 
     /// Builds a [`MockProver`] for testing without real proving or verification.

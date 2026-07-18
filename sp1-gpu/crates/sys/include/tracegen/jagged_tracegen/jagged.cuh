@@ -3,8 +3,7 @@
 #include <stdint.h>
 #include "sum_and_reduce/reduce.cuh"
 
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
+#include "backend/cooperative_groups.cuh"
 
 // Upper_bound for monotone start_idx (returns first j with start_idx[j] > x)
 __device__ __forceinline__ uint32_t

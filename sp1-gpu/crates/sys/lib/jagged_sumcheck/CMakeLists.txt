@@ -1,4 +1,4 @@
-add_library(jagged_sumcheck_objs OBJECT
+sp1_gpu_add_object_library(jagged_sumcheck_objs OBJECT
     hadamard.cu
     jagged_sumcheck.cu
 )

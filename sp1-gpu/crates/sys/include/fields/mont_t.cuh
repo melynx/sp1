@@ -8,8 +8,12 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "backend/runtime_api.cuh"
+
 #define inline __device__ __forceinline__
-#ifdef __GNUC__
+#if defined(SP1_GPU_BACKEND_ROCM)
+#define asm(...)
+#elif defined(__GNUC__)
 #define asm __asm__ __volatile__
 #else
 #define asm asm volatile
@@ -49,6 +53,77 @@ class __align__(((N + 63) / 64) & 1 ? 8 : 16) mont_t {
 
   private:
     uint32_t even[N_32];
+
+#if defined(SP1_GPU_BACKEND_ROCM)
+    // The Montgomery arithmetic below (mul_n/cmad_n/mad_n_redc/final_sub/... and the operator
+    // bodies) is written in inline PTX asm, which HIP stubs to nothing (`#define asm(...)` above),
+    // so on ROCm those paths would silently compute garbage. These portable helpers reimplement the
+    // multi-limb field arithmetic with 32x32->64 multiplies and explicit carries, and the operator
+    // bodies below dispatch to them under ROCm. CUDA keeps the original asm. Values are little-
+    // endian N_32-limb arrays in Montgomery form.
+
+    // r = a + b over N_32 limbs; returns the carry out of the top limb.
+    static inline uint32_t rocm_add_raw(uint32_t* r, const uint32_t* a, const uint32_t* b) {
+        uint64_t c = 0;
+        for (size_t i = 0; i < N_32; i++) {
+            uint64_t s = (uint64_t)a[i] + (uint64_t)b[i] + c;
+            r[i] = (uint32_t)s;
+            c = s >> 32;
+        }
+        return (uint32_t)c;
+    }
+
+    // If (extra_carry != 0) or (a >= MOD), then a -= MOD. One conditional subtract is enough because
+    // callers keep a < 2*MOD (the modulus has spare high bits: MOD < 2^(32*N_32-1)).
+    static inline void rocm_cond_sub_mod(uint32_t* a, uint32_t extra_carry) {
+        uint32_t t[N_32];
+        uint64_t borrow = 0;
+        for (size_t i = 0; i < N_32; i++) {
+            uint64_t d = (uint64_t)a[i] - (uint64_t)MOD[i] - borrow;
+            t[i] = (uint32_t)d;
+            borrow = (d >> 32) & 1;  // 1 iff the subtraction underflowed
+        }
+        if (extra_carry || borrow == 0) {  // a >= MOD
+            for (size_t i = 0; i < N_32; i++)
+                a[i] = t[i];
+        }
+    }
+
+    // r = a * b * R^-1 mod MOD, CIOS Montgomery multiplication. r may alias a and/or b (a and b are
+    // fully consumed into the scratch accumulator before r is written).
+    static inline void rocm_mulmont(uint32_t* r, const uint32_t* a, const uint32_t* b) {
+        uint32_t t[N_32 + 2];
+        for (size_t i = 0; i < N_32 + 2; i++)
+            t[i] = 0;
+        for (size_t i = 0; i < N_32; i++) {
+            // t += a * b[i]
+            uint64_t C = 0, P;
+            for (size_t j = 0; j < N_32; j++) {
+                P = (uint64_t)a[j] * (uint64_t)b[i] + (uint64_t)t[j] + C;
+                t[j] = (uint32_t)P;
+                C = P >> 32;
+            }
+            P = (uint64_t)t[N_32] + C;
+            t[N_32] = (uint32_t)P;
+            t[N_32 + 1] = (uint32_t)(P >> 32);
+            // m = t[0] * (-MOD^-1) mod 2^32; t += m*MOD (zeroes t[0]); then shift down one limb.
+            uint32_t m = (uint32_t)((uint64_t)t[0] * (uint64_t)M0);
+            P = (uint64_t)m * (uint64_t)MOD[0] + (uint64_t)t[0];
+            C = P >> 32;
+            for (size_t j = 1; j < N_32; j++) {
+                P = (uint64_t)m * (uint64_t)MOD[j] + (uint64_t)t[j] + C;
+                t[j - 1] = (uint32_t)P;
+                C = P >> 32;
+            }
+            P = (uint64_t)t[N_32] + C;
+            t[N_32 - 1] = (uint32_t)P;
+            t[N_32] = t[N_32 + 1] + (uint32_t)(P >> 32);
+        }
+        for (size_t i = 0; i < N_32; i++)
+            r[i] = t[i];
+        rocm_cond_sub_mod(r, t[N_32]);
+    }
+#endif
 
     static inline void mul_n(uint32_t* acc, const uint32_t* a, uint32_t bi, size_t n = N_32) {
         for (size_t j = 0; j < n; j += 2)
@@ -234,13 +309,31 @@ class __align__(((N + 63) / 64) & 1 ? 8 : 16) mont_t {
     }
 
     inline mont_t& operator+=(const mont_t& b) {
+#if defined(SP1_GPU_BACKEND_ROCM)
+        uint32_t carry = rocm_add_raw(&even[0], &even[0], &b[0]);
+        rocm_cond_sub_mod(&even[0], carry);
+        return *this;
+#else
         cadd_n(&even[0], &b[0]);
         final_subc();
         return *this;
+#endif
     }
     friend inline mont_t operator+(mont_t a, const mont_t& b) { return a += b; }
 
     inline mont_t& operator<<=(unsigned l) {
+#if defined(SP1_GPU_BACKEND_ROCM)
+        while (l--) {
+            uint32_t carry = 0;
+            for (size_t i = 0; i < N_32; i++) {
+                uint64_t s = ((uint64_t)even[i] << 1) | carry;
+                even[i] = (uint32_t)s;
+                carry = (uint32_t)(s >> 32);
+            }
+            rocm_cond_sub_mod(&even[0], carry);
+        }
+        return *this;
+#else
         while (l--) {
             asm("add.cc.u32 %0, %0, %0;" : "+r"(even[0]));
             for (size_t i = 1; i < n; i++)
@@ -249,10 +342,30 @@ class __align__(((N + 63) / 64) & 1 ? 8 : 16) mont_t {
         }
 
         return *this;
+#endif
     }
     friend inline mont_t operator<<(mont_t a, unsigned l) { return a <<= l; }
 
     inline mont_t& operator>>=(unsigned r) {
+#if defined(SP1_GPU_BACKEND_ROCM)
+        while (r--) {
+            // If odd, add MOD (odd modulus makes the sum even) so the >>1 stays in the field.
+            uint32_t carry = 0;
+            if (even[0] & 1) {
+                uint64_t c = 0;
+                for (size_t i = 0; i < N_32; i++) {
+                    uint64_t s = (uint64_t)even[i] + (uint64_t)MOD[i] + c;
+                    even[i] = (uint32_t)s;
+                    c = s >> 32;
+                }
+                carry = (uint32_t)c;
+            }
+            for (size_t i = 0; i + 1 < N_32; i++)
+                even[i] = (even[i] >> 1) | (even[i + 1] << 31);
+            even[N_32 - 1] = (even[N_32 - 1] >> 1) | (carry << 31);
+        }
+        return *this;
+#else
         size_t i;
         uint32_t tmp[n + 1];
 
@@ -274,10 +387,28 @@ class __align__(((N + 63) / 64) & 1 ? 8 : 16) mont_t {
         }
 
         return *this;
+#endif
     }
     friend inline mont_t operator>>(mont_t a, unsigned r) { return a >>= r; }
 
     inline mont_t& operator-=(const mont_t& b) {
+#if defined(SP1_GPU_BACKEND_ROCM)
+        uint32_t borrow = 0;
+        for (size_t i = 0; i < N_32; i++) {
+            uint64_t d = (uint64_t)even[i] - (uint64_t)b[i] - borrow;
+            even[i] = (uint32_t)d;
+            borrow = (uint32_t)((d >> 32) & 1);
+        }
+        if (borrow) {  // underflow: add MOD back
+            uint64_t c = 0;
+            for (size_t i = 0; i < N_32; i++) {
+                uint64_t s = (uint64_t)even[i] + (uint64_t)MOD[i] + c;
+                even[i] = (uint32_t)s;
+                c = s >> 32;
+            }
+        }
+        return *this;
+#else
         size_t i;
         uint32_t tmp[n], borrow;
 
@@ -297,11 +428,26 @@ class __align__(((N + 63) / 64) & 1 ? 8 : 16) mont_t {
         asm("}");
 
         return *this;
+#endif
     }
     friend inline mont_t operator-(mont_t a, const mont_t& b) { return a -= b; }
 
 #if 1
     inline mont_t& cneg(bool flag) {
+#if defined(SP1_GPU_BACKEND_ROCM)
+        uint32_t nonzero = 0;
+        for (size_t i = 0; i < N_32; i++)
+            nonzero |= even[i];
+        if (flag && nonzero != 0) {  // replace with MOD - even
+            uint32_t borrow = 0;
+            for (size_t i = 0; i < N_32; i++) {
+                uint64_t d = (uint64_t)MOD[i] - (uint64_t)even[i] - borrow;
+                even[i] = (uint32_t)d;
+                borrow = (uint32_t)((d >> 32) & 1);
+            }
+        }
+        return *this;
+#else
         size_t i;
         uint32_t tmp[n], is_zero = even[0];
         asm("{ .reg.pred %flag; setp.ne.u32 %flag, %0, 0;" ::"r"((int)flag));
@@ -319,6 +465,7 @@ class __align__(((N + 63) / 64) & 1 ? 8 : 16) mont_t {
 
         asm("}");
         return *this;
+#endif
     }
     static inline mont_t cneg(mont_t a, bool flag) { return a.cneg(flag); }
 #else
@@ -348,6 +495,21 @@ class __align__(((N + 63) / 64) & 1 ? 8 : 16) mont_t {
 
     // make the value "positive" and return the original "sign"
     inline bool abs() {
+#if defined(SP1_GPU_BACKEND_ROCM)
+        uint32_t tmp[N_32];
+        uint32_t borrow = 0;
+        for (size_t i = 0; i < N_32; i++) {
+            uint64_t d = (uint64_t)MOD[i] - (uint64_t)even[i] - borrow;
+            tmp[i] = (uint32_t)d;
+            borrow = (uint32_t)((d >> 32) & 1);
+        }
+        uint32_t sign = tmp[N_32 - 1] < even[N_32 - 1];
+        if (sign) {
+            for (size_t i = 0; i < N_32; i++)
+                even[i] = tmp[i];
+        }
+        return sign;
+#else
         size_t i;
         uint32_t tmp[n], sign;
 
@@ -363,6 +525,7 @@ class __align__(((N + 63) / 64) & 1 ? 8 : 16) mont_t {
         asm("}");
 
         return sign;
+#endif
     }
 
   private:
@@ -397,6 +560,11 @@ class __align__(((N + 63) / 64) & 1 ? 8 : 16) mont_t {
 
   public:
     friend inline mont_t operator*(const mont_t& a, const mont_t& b) {
+#if defined(SP1_GPU_BACKEND_ROCM)
+        mont_t ret;
+        rocm_mulmont(&ret.even[0], &a.even[0], &b.even[0]);
+        return ret;
+#else
         if (N % 32 == 0) {
             return wide_t{a, b};
         } else {
@@ -416,10 +584,18 @@ class __align__(((N + 63) / 64) & 1 ? 8 : 16) mont_t {
 
             return even;
         }
+#endif
     }
     inline mont_t& operator*=(const mont_t& a) { return *this = *this * a; }
 
+#if defined(SP1_GPU_BACKEND_ROCM)
+    inline mont_t& sqr() {
+        rocm_mulmont(&even[0], &even[0], &even[0]);
+        return *this;
+    }
+#else
     inline mont_t& sqr() { return *this = wide_t{*this}; }
+#endif
 
     // raise to a variable power, variable in respect to threadIdx,
     // but mind the ^ operator's precedence!
@@ -459,7 +635,18 @@ class __align__(((N + 63) / 64) & 1 ? 8 : 16) mont_t {
         }
         return *this;
     }
-    friend inline mont_t operator^(mont_t a, int p) { return p == 2 ? (mont_t)wide_t{a} : a ^= p; }
+    friend inline mont_t operator^(mont_t a, int p) {
+#if defined(SP1_GPU_BACKEND_ROCM)
+        if (p == 2) {
+            mont_t ret;
+            rocm_mulmont(&ret.even[0], &a.even[0], &a.even[0]);
+            return ret;
+        }
+        return a ^= p;
+#else
+        return p == 2 ? (mont_t)wide_t{a} : a ^= p;
+#endif
+    }
     inline mont_t operator()(int p) { return *this ^ p; }
     friend inline mont_t sqr(const mont_t& a) { return a ^ 2; }
 
@@ -491,8 +678,7 @@ class __align__(((N + 63) / 64) & 1 ? 8 : 16) mont_t {
                 asm("prmt.b32 %0, %1, %1, 0x0123;" : "=r"(lo[i]) : "r"(a[2 * n - 1 - i]));
         }
 
-        cadd_n(&even[0], &lo[0]);
-        final_subc();
+        *this += lo;  // equivalent to cadd_n + final_subc; dispatches to the ROCm path under HIP
         to();
     }
     inline void from() {
@@ -524,14 +710,19 @@ class __align__(((N + 63) / 64) & 1 ? 8 : 16) mont_t {
                 asm("prmt.b32 %0, %1, 0, 0x0123;" : "=r"(hi[i]) : "r"(a[n - 1 - i]));
         }
 
-        cadd_n(&even[0], &hi[0]);
-        final_subc();
+        *this += hi;  // equivalent to cadd_n + final_subc; dispatches to the ROCm path under HIP
         to();
     }
 
     static inline const mont_t& one() { return *reinterpret_cast<const mont_t*>(ONE); }
 
     static inline mont_t one(int or_zero) {
+#if defined(SP1_GPU_BACKEND_ROCM)
+        mont_t ret;
+        for (size_t i = 0; i < N_32; i++)
+            ret.even[i] = or_zero ? 0 : ONE[i];
+        return ret;
+#else
         mont_t ret;
         asm("{ .reg.pred %or_zero;");
         asm("setp.ne.s32 %or_zero, %0, 0;" : : "r"(or_zero));
@@ -539,6 +730,7 @@ class __align__(((N + 63) / 64) & 1 ? 8 : 16) mont_t {
             asm("selp.u32 %0, 0, %1, %or_zero;" : "=r"(ret[i]) : "r"(ONE[i]));
         asm("}");
         return ret;
+#endif
     }
 
     inline bool is_one() const {
@@ -581,6 +773,12 @@ class __align__(((N + 63) / 64) & 1 ? 8 : 16) mont_t {
     }
 
     friend inline mont_t czero(const mont_t& a, int set_z) {
+#if defined(SP1_GPU_BACKEND_ROCM)
+        mont_t ret;
+        for (size_t i = 0; i < N_32; i++)
+            ret.even[i] = set_z ? 0 : a[i];
+        return ret;
+#else
         mont_t ret;
         asm("{ .reg.pred %set_z;");
         asm("setp.ne.s32 %set_z, %0, 0;" : : "r"(set_z));
@@ -588,9 +786,16 @@ class __align__(((N + 63) / 64) & 1 ? 8 : 16) mont_t {
             asm("selp.u32 %0, 0, %1, %set_z;" : "=r"(ret[i]) : "r"(a[i]));
         asm("}");
         return ret;
+#endif
     }
 
     static inline mont_t csel(const mont_t& a, const mont_t& b, int sel_a) {
+#if defined(SP1_GPU_BACKEND_ROCM)
+        mont_t ret;
+        for (size_t i = 0; i < N_32; i++)
+            ret.even[i] = sel_a ? a[i] : b[i];
+        return ret;
+#else
         mont_t ret;
         asm("{ .reg.pred %sel_a;");
         asm("setp.ne.s32 %sel_a, %0, 0;" : : "r"(sel_a));
@@ -598,6 +803,7 @@ class __align__(((N + 63) / 64) & 1 ? 8 : 16) mont_t {
             asm("selp.u32 %0, %1, %2, %sel_a;" : "=r"(ret[i]) : "r"(a[i]), "r"(b[i]));
         asm("}");
         return ret;
+#endif
     }
 
   private:
@@ -622,6 +828,15 @@ class __align__(((N + 63) / 64) & 1 ? 8 : 16) mont_t {
         }
     }
     inline void mul_by_1() {
+#if defined(SP1_GPU_BACKEND_ROCM)
+        // Montgomery reduce in place: even <- even * R^-1 mod MOD. CIOS by raw integer 1 computes
+        // even * 1 * R^-1 = REDC(even).
+        uint32_t one_raw[N_32];
+        one_raw[0] = 1;
+        for (size_t i = 1; i < N_32; i++)
+            one_raw[i] = 0;
+        rocm_mulmont(&even[0], &even[0], &one_raw[0]);
+#else
         mont_t odd;
 
 #pragma unroll
@@ -632,9 +847,14 @@ class __align__(((N + 63) / 64) & 1 ? 8 : 16) mont_t {
 
         cadd_n(&even[0], &odd[1], n - 1);
         asm("addc.u32 %0, %0, 0;" : "+r"(even[n - 1]));
+#endif
     }
 
     inline void final_sub(uint32_t carry, uint32_t* tmp) {
+#if defined(SP1_GPU_BACKEND_ROCM)
+        (void)tmp;
+        rocm_cond_sub_mod(&even[0], carry);
+#else
         size_t i;
         asm("{ .reg.pred %top;");
 
@@ -650,9 +870,13 @@ class __align__(((N + 63) / 64) & 1 ? 8 : 16) mont_t {
             asm("@%top mov.b32 %0, %1;" : "+r"(even[i]) : "r"(tmp[i]));
 
         asm("}");
+#endif
     }
 
     inline void final_subc() {
+#if defined(SP1_GPU_BACKEND_ROCM)
+        rocm_cond_sub_mod(&even[0], 0);
+#else
         uint32_t carry, tmp[n];
 
         asm("addc.u32 %0, 0, 0;" : "=r"(carry));
@@ -667,6 +891,7 @@ class __align__(((N + 63) / 64) & 1 ? 8 : 16) mont_t {
         for (size_t i = 0; i < n; i++)
             asm("@%top mov.b32 %0, %1;" : "+r"(even[i]) : "r"(tmp[i]));
         asm("}");
+#endif
     }
 
     static inline void dot_n_redc(

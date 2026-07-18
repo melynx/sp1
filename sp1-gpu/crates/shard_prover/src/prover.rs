@@ -516,6 +516,20 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
             });
         let final_eval_point = sumcheck_proof.point_and_eval.0.clone();
 
+        // Check the GPU's jagged-polynomial claim at the CPU/GPU boundary. This is a
+        // correctness check, not a fallback: the GPU result remains the proof input.
+        #[cfg(all(feature = "rocm", debug_assertions))]
+        {
+            let expected_q_eval = params
+                .clone()
+                .into_verifier_params::<Felt>()
+                .full_jagged_little_polynomial_evaluation(&z_row, &z_col, &final_eval_point);
+            assert_eq!(
+                component_poly_evals[1], expected_q_eval,
+                "ROCm jagged sumcheck returned the wrong final q evaluation"
+            );
+        }
+
         // Use sync GPU jagged evaluation proof
         let jagged_eval_proof = tracing::debug_span!("jagged evaluation proof").in_scope(|| {
             prove_jagged_evaluation_sync::<Felt, Ext, GC::Challenger, PC::DeviceChallenger>(

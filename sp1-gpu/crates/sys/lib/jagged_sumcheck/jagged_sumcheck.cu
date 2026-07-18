@@ -3,8 +3,7 @@
 #include "tracegen/jagged_tracegen/jagged.cuh"
 
 
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
+#include "backend/cooperative_groups.cuh"
 
 
 __global__ void
@@ -75,6 +74,7 @@ __global__ void jaggedFixAndSum(
 
         // The inputs column lengths are padded to a multiple of 16. So therefore we can do two
         // fixes without checking bounds and handling padding.
+        Pair folded[2];
 #pragma unroll
         for (size_t j = i << 1; j < (i << 1) + 2; j++) {
 
@@ -85,16 +85,14 @@ __global__ void jaggedFixAndSum(
             size_t zeroIdx = j << 1;
             size_t restrictedIndex = j;
 
-            inputJaggedMle.denseData
-                .fixLastVariable(&hadamard, restrictedIndex, zeroIdx, colIdx, rowIdx << 1, alpha);
+            folded[j - (i << 1)] = inputJaggedMle.denseData.fixLastVariable(
+                &hadamard, restrictedIndex, zeroIdx, colIdx, rowIdx << 1, alpha);
         }
 
-        // Todo: directly return the result of fixlastvariable, unclear if this turns into another
-        // global access or not maybe not a huge speedup because of cache locality though
-        ext_t zeroValP = ext_t::load(hadamard.p, i << 1);
-        ext_t oneValP = ext_t::load(hadamard.p, (i << 1) + 1);
-        ext_t zeroValQ = ext_t::load(hadamard.q, i << 1);
-        ext_t oneValQ = ext_t::load(hadamard.q, (i << 1) + 1);
+        ext_t zeroValP = folded[0].p;
+        ext_t oneValP = folded[1].p;
+        ext_t zeroValQ = folded[0].q;
+        ext_t oneValQ = folded[1].q;
 
         evalZero += zeroValQ * zeroValP;
         evalHalf += (zeroValQ + oneValQ) * (zeroValP + oneValP);

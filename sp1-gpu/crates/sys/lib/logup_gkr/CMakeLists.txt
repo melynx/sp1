@@ -1,4 +1,4 @@
-add_library(logup_gkr_objs OBJECT
+sp1_gpu_add_object_library(logup_gkr_objs OBJECT
     execution.cu
     first_layer.cu
     round.cu

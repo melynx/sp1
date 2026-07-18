@@ -23,5 +23,11 @@ sp1-primitives = { workspace = true }
 slop-algebra = { workspace = true }
 tokio = { workspace = true }
 sp1-hypercube = { workspace = true }
+
+[features]
+default = ["cuda"]
+cuda = ["sp1-gpu-cudart/cuda"]
+rocm = ["sp1-gpu-cudart/rocm"]
+
 [lints]
 workspace = true

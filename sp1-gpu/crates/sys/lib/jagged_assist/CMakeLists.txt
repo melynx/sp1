@@ -1,4 +1,4 @@
-add_library(jagged_assist_objs OBJECT
+sp1_gpu_add_object_library(jagged_assist_objs OBJECT
     branching_program.cu
     fold_metadata.cu
     chip_layouts.cu

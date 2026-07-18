@@ -8,9 +8,10 @@
 #include <cassert>
 #include <cstdint>
 
+#include "backend/runtime_api.cuh"
 #include "fields/ptx.cuh"
 
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) && !defined(SP1_GPU_BACKEND_ROCM)
 
 #define inline __device__ __forceinline__
 #ifdef __GNUC__
@@ -562,6 +563,10 @@ __device__ __forceinline__ kb31_t::accel_t kb31_t::accel_t::operator-(const acce
 
 #else
 
+#if defined(SP1_GPU_BACKEND_ROCM)
+#define inline __host__ __device__ inline
+#endif
+
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-parameter"
@@ -569,11 +574,11 @@ __device__ __forceinline__ kb31_t::accel_t kb31_t::accel_t::operator-(const acce
 
 class kb31_t {
   private:
-    static const uint32_t M = 0x77ffffffu;
-    static const uint32_t RR = 0x45dddde3u;
-    static const uint32_t ONE = 0x0ffffffeu;
+    static const uint32_t M = 0x7effffffu;
+    static const uint32_t RR = 0x17f7efe4u;
+    static const uint32_t ONE = 0x01fffffeu;
     static const uint32_t MONTY_BITS = 32;
-    static const uint32_t MONTY_MU = 0x88000001;
+    static const uint32_t MONTY_MU = 0x81000001;
     static const uint32_t MONTY_MASK = ((1ULL << MONTY_BITS) - 1);
 
   public:
@@ -646,13 +651,13 @@ class kb31_t {
 
     inline kb31_t square() { return *this * *this; }
 
-    friend kb31_t operator+(kb31_t a, kb31_t b) { return a += b; }
+    friend __host__ __device__ kb31_t operator+(kb31_t a, kb31_t b) { return a += b; }
 
-    friend kb31_t operator-(kb31_t a, kb31_t b) { return a -= b; }
+    friend __host__ __device__ kb31_t operator-(kb31_t a, kb31_t b) { return a -= b; }
 
     inline kb31_t operator-() const { return kb31_t::zero() - *this; }
 
-    friend kb31_t operator*(kb31_t a, kb31_t b) { return a *= b; }
+    friend __host__ __device__ kb31_t operator*(kb31_t a, kb31_t b) { return a *= b; }
 
     inline kb31_t& operator<<=(uint32_t l) {
         while (l--) {
@@ -702,6 +707,18 @@ class kb31_t {
         return p1111110111111111111111111111111;
     }
 
+    friend inline kb31_t operator/(kb31_t a, kb31_t b) { return a * b.reciprocal(); }
+
+    static inline kb31_t csel(const kb31_t a, const kb31_t b, int sel_a) {
+        return sel_a ? a : b;
+    }
+
+    inline void shfl_bfly(uint32_t laneMask) { val = __shfl_xor_sync(0xFFFFFFFF, val, laneMask); }
+
+    inline kb31_t interpolateLinear(const kb31_t one, const kb31_t zero) const {
+        return zero + *this * (one - zero);
+    }
+
     static inline kb31_t sqr_n(kb31_t s, uint32_t n) {
         while (n--)
             s.sqr();
@@ -730,13 +747,17 @@ class kb31_t {
         return *this;
     }
 
-    friend kb31_t operator^(kb31_t a, uint32_t b) { return a ^= b; }
+    friend __host__ __device__ kb31_t operator^(kb31_t a, uint32_t b) { return a ^= b; }
 
-    inline kb31_t& sqr() { return *this; }
+    inline kb31_t& sqr() { return *this *= *this; }
 
     inline void set_to_zero() { val = 0; }
 
     inline bool is_zero() const { return val == 0; }
 };
+
+#if defined(SP1_GPU_BACKEND_ROCM)
+#undef inline
+#endif
 
 #endif // __CUDA__ARCH__

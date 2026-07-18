@@ -6,6 +6,58 @@
 
 #include <cstdint>
 
+#if defined(SP1_GPU_BACKEND_ROCM)
+
+#ifndef __forceinline__
+#define __forceinline__ __attribute__((always_inline)) inline
+#endif
+
+__device__ __forceinline__ void pack(uint64_t& d, uint32_t a0, uint32_t a1) {
+    d = static_cast<uint64_t>(a0) | (static_cast<uint64_t>(a1) << 32);
+}
+
+__device__ __forceinline__ void unpack(uint32_t& d0, uint32_t& d1, uint64_t a) {
+    d0 = static_cast<uint32_t>(a);
+    d1 = static_cast<uint32_t>(a >> 32);
+}
+
+__device__ __forceinline__ void add(uint32_t& d, uint32_t a, uint32_t b) { d = a + b; }
+__device__ __forceinline__ void add(uint64_t& d, uint64_t a, uint64_t b) { d = a + b; }
+__device__ __forceinline__ void sub(uint32_t& d, uint32_t a, uint32_t b) { d = a - b; }
+__device__ __forceinline__ void sub(uint64_t& d, uint64_t a, uint64_t b) { d = a - b; }
+
+__device__ __forceinline__ void mul_lo(uint32_t& d, uint32_t a, uint32_t b) {
+    d = static_cast<uint32_t>(static_cast<uint64_t>(a) * b);
+}
+__device__ __forceinline__ void mul_lo(uint64_t& d, uint64_t a, uint64_t b) { d = a * b; }
+__device__ __forceinline__ void mul_hi(uint32_t& d, uint32_t a, uint32_t b) {
+    d = static_cast<uint32_t>((static_cast<uint64_t>(a) * b) >> 32);
+}
+__device__ __forceinline__ void mul_hi(uint64_t& d, uint64_t a, uint64_t b) {
+    d = static_cast<uint64_t>((static_cast<unsigned __int128>(a) * b) >> 64);
+}
+__device__ __forceinline__ void mul_wide(uint64_t& d, uint32_t a, uint32_t b) {
+    d = static_cast<uint64_t>(a) * b;
+}
+
+__device__ __forceinline__ void mad_lo(uint32_t& d, uint32_t a, uint32_t b, uint32_t c) {
+    d = static_cast<uint32_t>(static_cast<uint64_t>(a) * b + c);
+}
+__device__ __forceinline__ void mad_lo(uint64_t& d, uint64_t a, uint64_t b, uint64_t c) {
+    d = a * b + c;
+}
+__device__ __forceinline__ void mad_hi(uint32_t& d, uint32_t a, uint32_t b, uint32_t c) {
+    d = static_cast<uint32_t>((static_cast<uint64_t>(a) * b + c) >> 32);
+}
+__device__ __forceinline__ void mad_hi(uint64_t& d, uint64_t a, uint64_t b, uint64_t c) {
+    d = static_cast<uint64_t>((static_cast<unsigned __int128>(a) * b + c) >> 64);
+}
+__device__ __forceinline__ void mad_wide(uint64_t& d, uint32_t a, uint32_t b, uint64_t c) {
+    d = static_cast<uint64_t>(a) * b + c;
+}
+
+#else
+
 // Pack
 
 __device__ __forceinline__ void pack(uint64_t& d, uint32_t a0, uint32_t a1) {
@@ -198,3 +250,5 @@ __device__ __forceinline__ void madc_wide(uint64_t& d, uint32_t a, uint32_t b, u
                  : "=l"(d)
                  : "r"(a), "r"(b), "l"(c));
 }
+
+#endif

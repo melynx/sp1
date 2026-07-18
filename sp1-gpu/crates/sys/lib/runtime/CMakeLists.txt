@@ -1,4 +1,4 @@
-add_library(runtime_objs OBJECT
+sp1_gpu_add_object_library(runtime_objs OBJECT
     exception.cu
     mem_pool.cu
     memory.cu

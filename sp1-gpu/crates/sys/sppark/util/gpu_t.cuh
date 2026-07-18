@@ -6,7 +6,7 @@
 #define __SPPARK_UTIL_GPU_T_CUH__
 
 #ifndef __CUDACC__
-# include <cuda_runtime.h>
+# include "backend/runtime_api.cuh"
 #endif
 
 #include "thread_pool_t.hpp"

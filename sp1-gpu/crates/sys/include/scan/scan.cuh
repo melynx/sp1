@@ -1,5 +1,7 @@
 #pragma once
 
+#include "backend/runtime_api.cuh"
+
 #include <cstdint>
 
 // Scan kernel for T with large sizeof(T).
@@ -48,7 +50,8 @@ __device__ __inline__ void BrentKungScan(
 
 template <typename T>
 __global__ void SingleBlockScan(T* d_out, T* d_in, size_t n) {
-    __shared__ T aux[SECTION_SIZE];
+    __shared__ __align__(16) unsigned char aux_raw[sizeof(T) * SECTION_SIZE];
+    T* aux = reinterpret_cast<T*>(aux_raw);
     size_t block_idx = blockIdx.x;
     size_t block_dim = blockDim.x;
     size_t thread_idx = threadIdx.x;
@@ -67,32 +70,31 @@ Scan(T* d_out, T* d_in, size_t n, T* scan_values, uint32_t* BlockCounter, uint32
     size_t bid = bid_s;
 
     // Peform a scan on the local block.
-    __shared__ T aux[SECTION_SIZE];
+    __shared__ __align__(16) unsigned char aux_raw[sizeof(T) * SECTION_SIZE];
+    T* aux = reinterpret_cast<T*>(aux_raw);
     BrentKungScan(d_out, d_in, aux, bid, blockDim.x, threadIdx.x, n);
 
     // Get the sum of the previous block, add it to the sum of the current block and broadcast it
     // to the next block.
-    __shared__ T previous_sum;
+    __shared__ __align__(16) unsigned char previous_sum_raw[sizeof(T)];
+    T* previous_sum = reinterpret_cast<T*>(previous_sum_raw);
     if (threadIdx.x == 0) {
         // Wait for the previous flag.
-        while (atomicAdd(&flags[bid], 0) == 0) {
+        while (sp1_device_load_acquire(&flags[bid]) == 0) {
         };
         // Read previous partial sum.
-        previous_sum = scan_values[bid];
+        *previous_sum = scan_values[bid];
         // Propagate current sum.
-        scan_values[bid + 1] = aux[SECTION_SIZE - 1] + previous_sum;
-        // Memory fence to ensure previous partial sum is visible to the next block.
-        __threadfence();
-        // Set flag.
-        atomicAdd(&flags[bid + 1], 1);
+        scan_values[bid + 1] = aux[SECTION_SIZE - 1] + *previous_sum;
+        sp1_device_store_release(&flags[bid + 1], 1);
     }
     __syncthreads();
 
     // Add the sum of the previous block to scan entries of the current block.
     size_t i = 2 * bid * blockDim.x + threadIdx.x;
     if (i < n)
-        d_out[i] += previous_sum;
+        d_out[i] += *previous_sum;
     if (i + blockDim.x < n)
-        d_out[i + blockDim.x] += previous_sum;
+        d_out[i + blockDim.x] += *previous_sum;
 }
 } // namespace scan_large

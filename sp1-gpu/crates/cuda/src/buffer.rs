@@ -2,10 +2,17 @@ use std::mem::MaybeUninit;
 
 use slop_alloc::{mem::CopyError, Buffer, HasBackend, Slice};
 
-use crate::{DeviceCopy, TaskScope};
+use crate::{sync::CudaSend, DeviceCopy, TaskScope};
 
 pub struct DeviceBuffer<T> {
     buf: Buffer<T, TaskScope>,
+}
+
+impl<T: Send> CudaSend for DeviceBuffer<T> {
+    unsafe fn send_to_scope(mut self, scope: &TaskScope) -> Self {
+        self.buf = unsafe { self.buf.send_to_scope(scope) };
+        self
+    }
 }
 
 impl<T: DeviceCopy> HasBackend for DeviceBuffer<T> {

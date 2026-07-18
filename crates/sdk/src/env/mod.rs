@@ -11,6 +11,8 @@ use crate::{
 
 #[cfg(feature = "cuda")]
 use crate::{cuda::builder::CudaProverBuilder, CudaProver};
+#[cfg(feature = "rocm")]
+use crate::{rocm::builder::RocmProverBuilder, RocmProver};
 use sp1_core_executor::SP1CoreOpts;
 
 #[cfg(feature = "network")]
@@ -41,6 +43,9 @@ pub enum EnvProver {
     /// A CUDA prover.
     #[cfg(feature = "cuda")]
     Cuda(CudaProver),
+    /// A ROCm prover.
+    #[cfg(feature = "rocm")]
+    Rocm(RocmProver),
     /// A network prover.
     #[cfg(feature = "network")]
     Network(NetworkProver),
@@ -108,6 +113,10 @@ impl EnvProver {
             "cuda" => Self::Cuda(CudaProverBuilder::new_with_machine(machine).build().await),
             #[cfg(not(feature = "cuda"))]
             "cuda" => panic!("The CUDA prover requires the `cuda` feature to be enabled"),
+            #[cfg(feature = "rocm")]
+            "rocm" => Self::Rocm(RocmProverBuilder::new_with_machine(machine).build().await),
+            #[cfg(not(feature = "rocm"))]
+            "rocm" => panic!("The ROCm prover requires the `rocm` feature to be enabled"),
             "mock" => Self::Mock(MockProver::new_with_machine(machine).await),
             "light" => Self::Light(LightProver::new_with_machine(machine).await),
             #[cfg(feature = "network")]
@@ -145,6 +154,8 @@ impl Prover for EnvProver {
             Self::Cpu(prover) => prover.inner(),
             #[cfg(feature = "cuda")]
             Self::Cuda(prover) => prover.inner(),
+            #[cfg(feature = "rocm")]
+            Self::Rocm(prover) => prover.inner(),
             Self::Mock(prover) => prover.inner(),
             Self::Light(prover) => prover.inner(),
             #[cfg(feature = "network")]
@@ -162,6 +173,11 @@ impl Prover for EnvProver {
                 Self::Cuda(prover) => {
                     let pk = prover.setup(elf).await?;
                     Ok(EnvProvingKey::cuda(pk))
+                }
+                #[cfg(feature = "rocm")]
+                Self::Rocm(prover) => {
+                    let pk = prover.setup(elf).await?;
+                    Ok(EnvProvingKey::rocm(pk))
                 }
                 Self::Mock(prover) => {
                     let pk = prover.setup(elf).await?;
@@ -194,6 +210,8 @@ impl Prover for EnvProver {
             Self::Cpu(prover) => prover.verify(proof, vkey, status_code),
             #[cfg(feature = "cuda")]
             Self::Cuda(prover) => prover.verify(proof, vkey, status_code),
+            #[cfg(feature = "rocm")]
+            Self::Rocm(prover) => prover.verify(proof, vkey, status_code),
             Self::Mock(prover) => prover.verify(proof, vkey, status_code),
             Self::Light(prover) => prover.verify(proof, vkey, status_code),
             #[cfg(feature = "network")]

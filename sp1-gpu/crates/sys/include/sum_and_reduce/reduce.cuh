@@ -1,7 +1,7 @@
 #pragma once
 
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
+#include "backend/cooperative_groups.cuh"
+#include "backend/reduce.cuh"
 
 namespace cg = cooperative_groups;
 
@@ -15,15 +15,13 @@ namespace cg = cooperative_groups;
 // thread must explicitly broadcast (e.g. write to `shared[0]` then
 // `block.sync()`).
 //
-// Back-to-back calls *must* `block.sync()` between them: this function
-// ends with `block.sync()` inside the tree loop, then a non-synced load
-// of `shared[0]`, so a slow thread's load can otherwise race the next
-// call's `shared[meta_group_rank()] = val` write.
+// The final barrier lets callers safely make back-to-back reductions with
+// the same shared memory.
 template <typename F, typename TyBlock, typename TyTile>
 __device__ __forceinline__ F
 partialBlockReduce(const TyBlock& block, const TyTile& tile, F val, F* shared) {
     // Warp-level reduction within tiles
-    val = cg::reduce(tile, val, cg::plus<F>());
+    val = sp1_gpu_backend::reduce(tile, val, sp1_gpu_backend::Plus<F>());
 
     // Only the first thread of each warp writes to shared memory
     if (tile.thread_rank() == 0) {
@@ -64,7 +62,9 @@ partialBlockReduce(const TyBlock& block, const TyTile& tile, F val, F* shared) {
         // Synchronize after each step
         block.sync();
     }
-    return shared[0];
+    F result = shared[0];
+    block.sync();
+    return result;
 }
 
 // A reduction kernel for Felt
@@ -76,3 +76,4 @@ extern "C" void* reduce_kernel_ext();
 // contributes `input[threadIdx.x]` and the per-block sum is written to
 // `output[0]`. Used to verify correctness for non-power-of-2 warp counts.
 extern "C" void* partial_block_reduce_test_kernel_felt();
+extern "C" void* partial_block_reduce_test_kernel_ext();

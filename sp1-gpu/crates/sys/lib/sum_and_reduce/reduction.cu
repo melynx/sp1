@@ -1,7 +1,6 @@
 #include "sum_and_reduce/reduction.cuh"
 
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
+#include "backend/cooperative_groups.cuh"
 
 #include "fields/kb31_extension_t.cuh"
 #include "fields/kb31_t.cuh"
