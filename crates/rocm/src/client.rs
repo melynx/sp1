@@ -117,7 +117,7 @@ impl RocmClient {
 
 struct RocmClientInner {
     stream: Option<Mutex<UnixStream>>,
-    _child: Child,
+    _child: Option<Child>,
 }
 
 impl RocmClientInner {
@@ -133,11 +133,17 @@ impl RocmClientInner {
             return Ok(RocmClient { inner: client });
         }
 
-        // Actually start the server now that we know there isn't one running.
-        let child = crate::server::start_server(rocm_id).await?;
-
-        // Connect to the server we just started.
-        let connection = Self::connect_inner(rocm_id).await?;
+        // A server may have been started by another process. Reuse it instead
+        // of starting a second server for the same device.
+        let socket_path = socket_path(rocm_id);
+        let (connection, child) = match Self::connect_once(&socket_path).await {
+            Ok(connection) => (connection, None),
+            Err(_) => {
+                let child = crate::server::start_server(rocm_id).await?;
+                let connection = Self::connect_inner(rocm_id).await?;
+                (connection, Some(child))
+            }
+        };
         let inner = RocmClientInner { stream: Some(Mutex::new(connection)), _child: child };
 
         let inner = Arc::new(inner);
@@ -151,7 +157,9 @@ impl RocmClientInner {
         let socket_path = socket_path(rocm_id);
 
         // Retry a few times, just in case the server hasnt started yet.
-        for _ in 0..10 {
+        // ROCm startup includes device and NTT setup. A second client can also
+        // lose the cross-process startup race and must wait for the winner.
+        for _ in 0..300 {
             let Ok(this) = Self::connect_once(&socket_path).await else {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;

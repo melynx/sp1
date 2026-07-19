@@ -2,19 +2,17 @@ use std::{
     alloc::Layout,
     ffi::c_void,
     future::{Future, IntoFuture},
-    mem::MaybeUninit,
     ops::Deref,
     pin::Pin,
     ptr::{self, NonNull},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, OnceLock, Weak,
+        Arc, OnceLock,
     },
     task::{Context, Poll},
     time::Duration,
 };
 
-use futures::{future::MapOkOrElse, TryFutureExt};
 use pin_project::pin_project;
 use slop_alloc::{
     mem::{CopyDirection, CopyError, DeviceMemory},
@@ -53,12 +51,20 @@ pub(crate) fn global_task_pool() -> &'static Arc<TaskPool> {
 }
 
 pub struct SpawnHandle<T> {
-    handle: JoinHandle<Result<T, CudaError>>,
+    handle: Option<JoinHandle<Result<T, CudaError>>>,
 }
 
 impl<T> SpawnHandle<T> {
     pub fn abort(&self) {
-        self.handle.abort();
+        self.handle.as_ref().expect("spawn handle already taken").abort();
+    }
+}
+
+impl<T> Drop for SpawnHandle<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
     }
 }
 
@@ -72,25 +78,36 @@ pub enum SpawnError {
     TaskSpawnError(#[from] TaskSpawnError),
 }
 
-fn map_ok_value<T>(e: Result<T, CudaError>) -> Result<T, SpawnError> {
-    e.map_err(SpawnError::CudaError)
+pub struct SpawnFuture<T> {
+    handle: JoinHandle<Result<T, CudaError>>,
 }
 
-fn map_err_value<T>(e: tokio::task::JoinError) -> Result<T, SpawnError> {
-    Err(SpawnError::JoinError(e))
+impl<T> Future for SpawnFuture<T> {
+    type Output = Result<T, SpawnError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.handle).poll(cx) {
+            Poll::Ready(Ok(Ok(value))) => Poll::Ready(Ok(value)),
+            Poll::Ready(Ok(Err(error))) => Poll::Ready(Err(SpawnError::CudaError(error))),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(SpawnError::JoinError(error))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<T> Drop for SpawnFuture<T> {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
 }
 
 impl<T> IntoFuture for SpawnHandle<T> {
     type Output = Result<T, SpawnError>;
 
-    type IntoFuture = MapOkOrElse<
-        JoinHandle<Result<T, CudaError>>,
-        fn(Result<T, CudaError>) -> Result<T, SpawnError>,
-        fn(tokio::task::JoinError) -> Result<T, SpawnError>,
-    >;
+    type IntoFuture = SpawnFuture<T>;
 
-    fn into_future(self) -> Self::IntoFuture {
-        self.handle.map_ok_or_else(map_err_value, map_ok_value)
+    fn into_future(mut self) -> Self::IntoFuture {
+        SpawnFuture { handle: self.handle.take().expect("spawn handle already taken") }
     }
 }
 
@@ -243,6 +260,44 @@ struct OwnedTask {
     inner: Worker<Task>,
 }
 
+struct TaskRunGuard {
+    task: Arc<OwnedTask>,
+    arena: Option<ProofArena>,
+    root_arena: bool,
+    armed: bool,
+}
+
+impl TaskRunGuard {
+    fn new(task: Arc<OwnedTask>, arena: Option<ProofArena>, root_arena: bool) -> Self {
+        Self { task, arena, root_arena, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TaskRunGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if self.root_arena {
+            if let Some(arena) = &self.arena {
+                arena
+                    .cancel_root(|| unsafe { self.task.stream_synchronize() })
+                    .expect("cancelled proof failed while waiting for its root stream");
+                return;
+            }
+        }
+        unsafe {
+            self.task
+                .stream_synchronize()
+                .expect("cancelled GPU task failed while waiting for its stream");
+        }
+    }
+}
+
 impl std::fmt::Debug for OwnedTask {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "OwnedTask {{ inner: {:?} }}", self.inner.deref())
@@ -286,7 +341,7 @@ impl TaskPool {
             let task = TaskPool::task(queue).await.expect("failed to acquire a task from the pool");
             task.run(f).await.await
         });
-        SpawnHandle { handle }
+        SpawnHandle { handle: Some(handle) }
     }
 
     pub fn spawn_blocking<F, R>(&self, f: F) -> SpawnHandle<R>
@@ -300,7 +355,7 @@ impl TaskPool {
             let task = Arc::new(task);
             task.run_sync(f)
         });
-        SpawnHandle { handle }
+        SpawnHandle { handle: Some(handle) }
     }
 
     /// Run a task on the task pool.
@@ -346,7 +401,7 @@ impl TaskPool {
 
 #[derive(Debug)]
 pub struct TaskScope {
-    task: Weak<OwnedTask>,
+    task: Arc<OwnedTask>,
     sub_arena: Option<Arc<TaskSubArena>>,
 }
 
@@ -361,7 +416,7 @@ impl Deref for TaskScope {
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        unsafe { &(*self.task.as_ptr()).inner }
+        &self.task.inner
     }
 }
 
@@ -378,6 +433,10 @@ unsafe extern "C" fn sync_host(ptr: *mut c_void) {
 }
 
 impl TaskScope {
+    fn new(task: Arc<OwnedTask>, sub_arena: Option<Arc<TaskSubArena>>) -> Self {
+        Self { task, sub_arena }
+    }
+
     pub fn arena_id(&self) -> Option<u64> {
         self.sub_arena.as_ref().map(|arena| arena.arena_id())
     }
@@ -504,7 +563,7 @@ impl TaskScope {
     ///
     /// The other task will wait for the current task to finish.
     #[inline]
-    unsafe fn join(self, parent: &TaskScope) -> Result<(), CudaError> {
+    unsafe fn join(&self, parent: &TaskScope) -> Result<(), CudaError> {
         parent.stream.wait_unchecked(&self.end_event)
     }
 
@@ -535,11 +594,11 @@ impl TaskScope {
     }
 
     pub fn owner(&self) -> TaskPool {
-        TaskPool { inner: self.task.upgrade().unwrap().inner.owner().clone() }
+        TaskPool { inner: self.task.inner.owner().clone() }
     }
 
     fn owner_queue(&self) -> Arc<WorkerQueue<Task>> {
-        self.task.upgrade().unwrap().inner.owner().clone()
+        self.task.inner.owner().clone()
     }
 
     /// Spawns a new task from the current task pool.
@@ -554,7 +613,7 @@ impl TaskScope {
     {
         let parent = self.clone();
         let handle = tokio::spawn(async move { parent.run_in_place(f).await });
-        SpawnHandle { handle }
+        SpawnHandle { handle: Some(handle) }
     }
 
     /// Runs a task in place in a new stream.
@@ -742,18 +801,23 @@ impl OwnedTask {
         let strong_ptr = Arc::new(self);
         let proof_arena = inherited_arena;
         let sub_arena = proof_arena.clone().map(|arena| Arc::new(TaskSubArena::new(arena)));
-        let scope = TaskScope { task: Arc::downgrade(&strong_ptr), sub_arena };
+        let scope = TaskScope::new(strong_ptr.clone(), sub_arena);
+        let mut run_guard = TaskRunGuard::new(strong_ptr.clone(), proof_arena.clone(), root_arena);
         let value = f(scope.clone()).await;
         unsafe { scope.stream.record_unchecked(&scope.end_event).unwrap() };
         if root_arena {
-            if let Some(arena) = proof_arena {
-                let completion =
-                    CudaEvent::create().expect("failed to create proof completion event");
-                unsafe { scope.stream.record_unchecked(&completion).unwrap() };
-                arena.finish(completion);
+            if let Some(arena) = &proof_arena {
+                arena
+                    .close_root(|| {
+                        let completion = CudaEvent::create()?;
+                        unsafe { scope.stream.record_unchecked(&completion)? };
+                        Ok(completion)
+                    })
+                    .expect("failed to record proof completion event");
             }
         }
-        TaskHandle { task: strong_ptr, scope, value }
+        run_guard.disarm();
+        TaskHandle { value: Some(value), scope: Some(scope), task: Some(strong_ptr) }
     }
 
     fn run_sync<F, R>(self: Arc<Self>, f: F) -> Result<R, CudaError>
@@ -767,17 +831,21 @@ impl OwnedTask {
                 None
             };
         let sub_arena = proof_arena.clone().map(|arena| Arc::new(TaskSubArena::new(arena)));
-        let scope = TaskScope { task: Arc::downgrade(&self), sub_arena };
+        let scope = TaskScope::new(self.clone(), sub_arena);
+        let mut run_guard = TaskRunGuard::new(self.clone(), proof_arena.clone(), true);
         let output = f(scope.clone());
         unsafe {
             scope.stream.record_unchecked(&scope.end_event)?;
             scope.end_event.synchronize()?;
         };
         if let Some(arena) = proof_arena {
-            let completion = CudaEvent::create()?;
-            unsafe { scope.stream.record_unchecked(&completion)? };
-            arena.finish(completion);
+            arena.close_root(|| {
+                let completion = CudaEvent::create()?;
+                unsafe { scope.stream.record_unchecked(&completion)? };
+                Ok(completion)
+            })?;
         }
+        run_guard.disarm();
         Ok(output)
     }
 }
@@ -799,36 +867,75 @@ impl IntoFuture for TaskScope {
 }
 
 pub struct TaskHandle<T> {
-    task: Arc<OwnedTask>,
-    scope: TaskScope,
-    value: T,
+    value: Option<T>,
+    scope: Option<TaskScope>,
+    task: Option<Arc<OwnedTask>>,
 }
 
 impl<T> TaskHandle<T> {
-    pub fn join(self, parent: &TaskScope) -> Result<T, CudaError>
+    /// Borrows the task output while retaining ownership of its stream worker.
+    pub fn value(&self) -> &T {
+        self.value.as_ref().expect("task value already taken")
+    }
+
+    /// Takes the task output while retaining ownership of its stream worker.
+    pub fn take_value(&mut self) -> T {
+        self.value.take().expect("task value already taken")
+    }
+
+    pub fn join(mut self, parent: &TaskScope) -> Result<T, CudaError>
     where
         T: CudaSend,
     {
         // See [TaskHandle::join] for the explanation of safety. Here this is a bit more complex,
         // but the eventual panic still applies. This is enough in most cases.
         unsafe {
-            self.scope.join(parent)?;
-            let value = self.value.send_to_scope(parent);
+            let scope = self.scope.take().expect("task scope already taken");
+            if let Some(arena) = scope.sub_arena.as_ref().map(|arena| arena.proof_arena()) {
+                arena.join_child(
+                    || scope.join(parent),
+                    || {
+                        let completion = CudaEvent::create()?;
+                        scope.stream.record_unchecked(&completion)?;
+                        Ok(completion)
+                    },
+                )?;
+            } else {
+                scope.join(parent)?;
+            }
+            let value = self.value.take().expect("task value already taken").send_to_scope(parent);
+            drop(self.task.take());
             // Return the value to the caller.
             Ok(value)
         }
     }
 
     pub fn is_finished(&self) -> Result<bool, CudaError> {
-        self.task.is_finished()
+        self.task.as_ref().expect("task already taken").is_finished()
+    }
+}
+
+impl<T> Drop for TaskHandle<T> {
+    fn drop(&mut self) {
+        // Values can own device buffers whose deallocation is queued on this task's stream. Drop
+        // them before synchronizing and releasing the worker.
+        drop(self.value.take());
+        drop(self.scope.take());
+        if let Some(task) = &self.task {
+            unsafe {
+                task.stream_synchronize()
+                    .expect("dropped GPU task failed while waiting for its stream");
+            }
+        }
     }
 }
 
 #[pin_project]
 pub struct StreamHandleFuture<T> {
+    value: Option<T>,
+    scope: Option<TaskScope>,
     #[pin]
     callback: StreamCallbackFuture<Arc<OwnedTask>>,
-    value: MaybeUninit<T>,
 }
 
 impl<T> Future for StreamHandleFuture<T> {
@@ -836,15 +943,18 @@ impl<T> Future for StreamHandleFuture<T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
-        this.callback.poll(cx).map(|res| {
-            res.map(|_| {
-                let uinit = MaybeUninit::uninit();
-                let ret = std::mem::replace(this.value, uinit);
-                // We assume that JoinHandleFuture is created from a JoinHandle, so the value is
-                // always initialized.
-                unsafe { ret.assume_init() }
-            })
-        })
+        match this.callback.poll(cx) {
+            Poll::Ready(result) => {
+                // The callback has released its copy of the task. Release the scope's copy now so
+                // the worker returns to the pool before the surrounding async state is dropped.
+                this.scope.take();
+                Poll::Ready(
+                    result
+                        .map(|_| this.value.take().expect("task future completed more than once")),
+                )
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -853,29 +963,34 @@ impl<T> IntoFuture for TaskHandle<T> {
     type IntoFuture = StreamHandleFuture<T>;
 
     #[inline]
-    fn into_future(self) -> Self::IntoFuture {
+    fn into_future(mut self) -> Self::IntoFuture {
         StreamHandleFuture {
-            callback: StreamCallbackFuture::new(self.task),
-            value: MaybeUninit::new(self.value),
+            value: self.value.take(),
+            scope: self.scope.take(),
+            callback: StreamCallbackFuture::new(self.task.take().expect("task already taken")),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-
+    use super::DEFAULT_NUM_TASKS;
     use crate::{args, sync::CudaSend, DeviceBuffer, TaskPoolBuilder};
     use rand::{rngs::StdRng, Rng, SeedableRng};
+    use serial_test::serial;
     use slop_algebra::{AbstractExtensionField, AbstractField};
     use slop_alloc::mem::DeviceMemory;
     use sp1_primitives::{SP1ExtensionField, SP1Field};
+    use std::time::Duration;
 
     #[tokio::test]
+    #[serial]
     async fn test_global_task_pool() {
         crate::spawn(|_| async {}).await.unwrap();
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_local_pool() {
         let num_workers = 10;
         let num_callers = 100;
@@ -908,7 +1023,22 @@ mod tests {
         assert_eq!(count, num_callers);
     }
 
+    #[cfg(feature = "rocm")]
+    #[tokio::test]
+    #[serial]
+    async fn test_rocm_task_pool_reuses_idle_stream_workers() {
+        let pool = TaskPoolBuilder::new().num_tasks(2).build().unwrap();
+        for iteration in 0..128 {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                pool.run_proof(|_| async {}).await.await.unwrap();
+            })
+            .await
+            .unwrap_or_else(|_| panic!("worker was not returned after iteration {iteration}"));
+        }
+    }
+
     #[test]
+    #[serial]
     fn test_partial_block_reduce_wave_counts() {
         crate::run_sync_in_place(|scope| {
             for waves in [1usize, 2, 3, 5, 7, 9] {
@@ -965,6 +1095,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_koala_bear_extension_multiplication() {
         const MODULUS: u32 = 0x7f00_0001;
         let mut rng = StdRng::seed_from_u64(0x524f_434d);
@@ -1021,6 +1152,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_arena_preserves_device_allocation_alignment() {
         crate::run_sync_in_place(|scope| {
             let buffers = (1..=64)
@@ -1033,47 +1165,291 @@ mod tests {
         .unwrap();
     }
 
-    #[tokio::test]
-    #[ignore = "10,000-round GPU allocator stress test"]
-    async fn test_rocm_allocator_stress() {
+    #[cfg(feature = "rocm")]
+    async fn assert_allocator_reuse_pattern(pattern: u8) {
         let handle = crate::run_proof_in_place(|scope| async move {
-            let mut sizes = (0..10_000usize)
-                .map(|i| 256 + (i.wrapping_mul(7_919) % (32 * 1024 - 256)))
-                .collect::<Vec<_>>();
-            sizes.extend((8..=28).map(|power| 1usize << power));
-            sizes.push(258 * 1024 * 1024);
-
-            let mut buffers = Vec::with_capacity(sizes.len());
-            for (index, size) in sizes.into_iter().enumerate() {
-                let mut buffer = DeviceBuffer::<u8>::with_capacity_in(size, scope.clone());
-                let pattern = (index % 251 + 1) as u8;
-                unsafe {
-                    scope
-                        .write_bytes(buffer.as_mut_ptr(), pattern, size)
-                        .expect("failed to fill stress allocation");
-                    buffer.set_len(size);
-                }
-                buffers.push((buffer, pattern));
+            let size = 1024 * 1024;
+            let mut buffer = DeviceBuffer::<u8>::with_capacity_in(size, scope.clone());
+            unsafe {
+                scope.write_bytes(buffer.as_mut_ptr(), pattern, size).unwrap();
+                buffer.set_len(size);
             }
-
-            let buffers = scope
-                .run_in_place(|child| async move {
-                    let buffers = buffers
-                        .into_iter()
-                        .map(|(buffer, pattern)| (unsafe { buffer.send_to_scope(&child) }, pattern))
-                        .collect::<Vec<_>>();
-                    for (buffer, pattern) in &buffers {
-                        let host = buffer.to_host().expect("failed to read stress allocation");
-                        assert!(host.iter().all(|value| value == pattern));
-                    }
-                    buffers
-                })
-                .await
-                .expect("allocator stress child task failed");
-
-            assert_eq!(buffers.len(), 10_022);
+            scope.synchronize_blocking().unwrap();
+            buffer.to_host().unwrap()
         })
         .await;
-        handle.await.expect("allocator stress root task failed");
+        let host = handle.await.unwrap();
+        assert!(host.iter().all(|value| *value == pattern));
+    }
+
+    #[cfg(feature = "rocm")]
+    #[tokio::test]
+    #[serial]
+    async fn test_rocm_allocator_root_cancellation_waits_for_stream() {
+        crate::run_proof_in_place(|_| async {}).await.await.unwrap();
+
+        let start = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_millis(20),
+            crate::run_proof_in_place(|scope| async move {
+                let size = 1024 * 1024;
+                let mut buffer = DeviceBuffer::<u8>::with_capacity_in(size, scope.clone());
+                unsafe {
+                    scope.write_bytes(buffer.as_mut_ptr(), 0x5a, size).unwrap();
+                    buffer.set_len(size);
+                }
+                scope.sleep(Duration::from_millis(200));
+                std::future::pending::<()>().await;
+                drop(buffer);
+            }),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(start.elapsed() >= Duration::from_millis(150));
+        assert_allocator_reuse_pattern(0xa5).await;
+    }
+
+    #[cfg(feature = "rocm")]
+    #[tokio::test]
+    #[serial]
+    async fn test_rocm_allocator_child_cancellation_waits_for_stream() {
+        crate::run_proof_in_place(|_| async {}).await.await.unwrap();
+
+        let start = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_millis(20),
+            crate::run_proof_in_place(|scope| async move {
+                scope
+                    .run_in_place(|child| async move {
+                        let size = 1024 * 1024;
+                        let mut buffer = DeviceBuffer::<u8>::with_capacity_in(size, child.clone());
+                        unsafe {
+                            child.write_bytes(buffer.as_mut_ptr(), 0x3c, size).unwrap();
+                            buffer.set_len(size);
+                        }
+                        child.sleep(Duration::from_millis(200));
+                        std::future::pending::<()>().await;
+                        drop(buffer);
+                    })
+                    .await
+                    .unwrap();
+            }),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(start.elapsed() >= Duration::from_millis(150));
+        assert_allocator_reuse_pattern(0xc3).await;
+    }
+
+    #[cfg(feature = "rocm")]
+    #[tokio::test]
+    #[serial]
+    async fn test_rocm_allocator_dropped_spawn_is_cancelled() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let handle = crate::run_proof_in_place(|scope| async move {
+            let child = scope.spawn(|child| async move {
+                let size = 1024 * 1024;
+                let mut buffer = DeviceBuffer::<u8>::with_capacity_in(size, child.clone());
+                unsafe {
+                    child.write_bytes(buffer.as_mut_ptr(), 0x69, size).unwrap();
+                    buffer.set_len(size);
+                }
+                child.sleep(Duration::from_millis(200));
+                started_tx.send(()).unwrap();
+                std::future::pending::<()>().await;
+                drop(buffer);
+            });
+            started_rx.await.unwrap();
+            drop(child);
+        })
+        .await;
+        handle.await.unwrap();
+        assert_allocator_reuse_pattern(0x96).await;
+    }
+
+    #[cfg(feature = "rocm")]
+    #[tokio::test]
+    #[serial]
+    async fn test_rocm_allocator_dropped_spawn_future_is_cancelled() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let handle = crate::run_proof_in_place(|scope| async move {
+            let child = scope.spawn(|child| async move {
+                let size = 1024 * 1024;
+                let mut buffer = DeviceBuffer::<u8>::with_capacity_in(size, child.clone());
+                unsafe {
+                    child.write_bytes(buffer.as_mut_ptr(), 0x6c, size).unwrap();
+                    buffer.set_len(size);
+                }
+                child.sleep(Duration::from_millis(200));
+                started_tx.send(()).unwrap();
+                std::future::pending::<()>().await;
+                drop(buffer);
+            });
+            started_rx.await.unwrap();
+            assert!(tokio::time::timeout(Duration::from_millis(20), child).await.is_err());
+        })
+        .await;
+        handle.await.unwrap();
+        assert_allocator_reuse_pattern(0xc6).await;
+    }
+
+    #[cfg(feature = "rocm")]
+    #[tokio::test]
+    #[serial]
+    async fn test_rocm_allocator_dropped_task_handle_waits_for_stream() {
+        let handle = crate::run_proof_in_place(|scope| async move {
+            let size = 1024 * 1024;
+            let mut buffer = DeviceBuffer::<u8>::with_capacity_in(size, scope.clone());
+            unsafe {
+                scope.write_bytes(buffer.as_mut_ptr(), 0x78, size).unwrap();
+                buffer.set_len(size);
+            }
+            scope.sleep(Duration::from_millis(200));
+            buffer
+        })
+        .await;
+        let start = std::time::Instant::now();
+        drop(handle);
+        assert!(start.elapsed() >= Duration::from_millis(150));
+        assert_allocator_reuse_pattern(0x87).await;
+    }
+
+    #[cfg(feature = "rocm")]
+    #[tokio::test]
+    #[serial]
+    async fn test_rocm_allocator_dropped_task_future_is_safe() {
+        let handle = crate::run_proof_in_place(|scope| async move {
+            let size = 1024 * 1024;
+            let mut buffer = DeviceBuffer::<u8>::with_capacity_in(size, scope.clone());
+            unsafe {
+                scope.write_bytes(buffer.as_mut_ptr(), 0x4b, size).unwrap();
+                buffer.set_len(size);
+            }
+            scope.sleep(Duration::from_millis(200));
+            buffer
+        })
+        .await;
+
+        let start = std::time::Instant::now();
+        let result = tokio::time::timeout(Duration::from_millis(20), handle).await;
+        assert!(result.is_err());
+        if crate::RocmAllocator::selected() == crate::RocmAllocator::Arena {
+            assert!(start.elapsed() >= Duration::from_millis(150));
+        }
+        assert_allocator_reuse_pattern(0xb4).await;
+    }
+
+    #[cfg(feature = "rocm")]
+    #[tokio::test]
+    #[serial]
+    async fn test_rocm_allocator_error_path_reuses_safely() {
+        let handle = crate::run_proof_in_place(|scope| async move {
+            let size = 1024 * 1024;
+            let mut buffer = DeviceBuffer::<u8>::with_capacity_in(size, scope.clone());
+            unsafe {
+                scope.write_bytes(buffer.as_mut_ptr(), 0x2d, size).unwrap();
+                buffer.set_len(size);
+            }
+            scope.sleep(Duration::from_millis(100));
+            Err::<(), &'static str>("expected prover error")
+        })
+        .await;
+        assert_eq!(handle.await.unwrap(), Err("expected prover error"));
+        assert_allocator_reuse_pattern(0xd2).await;
+    }
+
+    #[cfg(feature = "rocm")]
+    #[tokio::test]
+    #[serial]
+    async fn test_rocm_allocator_rejects_cross_arena_transfer() {
+        if crate::RocmAllocator::selected() != crate::RocmAllocator::Arena {
+            return;
+        }
+
+        let first = crate::run_proof_in_place(|scope| async move {
+            DeviceBuffer::<u8>::with_capacity_in(1024, scope)
+        })
+        .await
+        .await
+        .unwrap();
+
+        let task = tokio::spawn(async move {
+            let _ =
+                crate::run_proof_in_place(
+                    |scope| async move { unsafe { first.send_to_scope(&scope) } },
+                )
+                .await;
+        });
+        assert!(task.await.unwrap_err().is_panic());
+        assert_allocator_reuse_pattern(0x1e).await;
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    #[serial]
+    fn test_rocm_allocator_sync_panic_waits_for_stream() {
+        let start = std::time::Instant::now();
+        let result = std::panic::catch_unwind(|| {
+            let _ = crate::run_sync_in_place(|scope| {
+                scope.sleep(Duration::from_millis(200));
+                panic!("expected test panic");
+            });
+        });
+        assert!(result.is_err());
+        assert!(start.elapsed() >= Duration::from_millis(150));
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[ignore = "10,000-round GPU allocator stress test"]
+    async fn test_rocm_allocator_stress() {
+        const ROUNDS: usize = 10_000;
+        const STREAMS_PER_PROOF: usize = DEFAULT_NUM_TASKS;
+        const MIB: usize = 1024 * 1024;
+
+        let mut state = 0x8f3d_9a27_4c61_b5e2u64;
+        let mut cases = Vec::with_capacity(ROUNDS);
+        for index in 0..ROUNDS {
+            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let size = match index {
+                0..=20 => 1usize << (index + 8),
+                21 => 258 * MIB,
+                _ if index % 997 == 0 => 32 * MIB + state as usize % (224 * MIB + 1),
+                _ => 256 + state as usize % (MIB - 255),
+            };
+            cases.push((index, size));
+        }
+
+        for batch in cases.chunks(STREAMS_PER_PROOF) {
+            let batch = batch.to_vec();
+            let handle = crate::run_proof_in_place(|scope| async move {
+                let mut children = Vec::with_capacity(batch.len());
+                for (slot, (index, size)) in batch.into_iter().enumerate() {
+                    let pattern = (slot + 1) as u8;
+                    children.push(scope.spawn(move |child| async move {
+                        let mut buffer = DeviceBuffer::<u8>::with_capacity_in(size, child.clone());
+                        unsafe {
+                            child
+                                .write_bytes(buffer.as_mut_ptr(), pattern, size)
+                                .expect("failed to fill stress allocation");
+                            buffer.set_len(size);
+                        }
+                        (index, pattern, buffer)
+                    }));
+                }
+
+                for child in children {
+                    let (index, pattern, buffer) =
+                        child.await.expect("allocator stress child task failed");
+                    let host = buffer.to_host().expect("failed to read stress allocation");
+                    assert!(
+                        host.iter().all(|value| *value == pattern),
+                        "allocation pattern mismatch in round {index}"
+                    );
+                }
+            })
+            .await;
+            handle.await.expect("allocator stress root task failed");
+        }
     }
 }

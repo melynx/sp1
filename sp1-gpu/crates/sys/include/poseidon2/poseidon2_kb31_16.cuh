@@ -120,6 +120,9 @@ class KoalaBear {
         //   state[0] = monty_reduce(part_sum + (-state[0]).val)
         // where full_sum = Σ state[i].val (< 16*p < 2^35) and part_sum = full_sum - state[0].val.
         uint64_t sum64 = 0;
+#if defined(SP1_GPU_BACKEND_ROCM)
+#pragma unroll
+#endif
         for (int i = 0; i < WIDTH; i++) {
             sum64 += static_cast<uint64_t>(state[i].val);
         }
@@ -136,16 +139,25 @@ class KoalaBear {
     }
 
     __device__ static void externalLinearLayer(F_t state[WIDTH]) {
+#if defined(SP1_GPU_BACKEND_ROCM)
+#pragma unroll
+#endif
         for (int i = 0; i < WIDTH; i += 4) {
             mdsLightPermutation4x4(state + i);
         }
         F_t sums[4] = {state[0], state[1], state[2], state[3]};
+#if defined(SP1_GPU_BACKEND_ROCM)
+#pragma unroll
+#endif
         for (int i = 4; i < WIDTH; i += 4) {
             sums[0] += state[i];
             sums[1] += state[i + 1];
             sums[2] += state[i + 2];
             sums[3] += state[i + 3];
         }
+#if defined(SP1_GPU_BACKEND_ROCM)
+#pragma unroll
+#endif
         for (int i = 0; i < WIDTH; i++) {
             state[i] += sums[i & 3];
         }

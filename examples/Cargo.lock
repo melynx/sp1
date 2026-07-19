@@ -7073,6 +7073,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "sp1-rocm"
+version = "6.3.1"
+dependencies = [
+ "bincode",
+ "bytes",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sp1-core-executor",
+ "sp1-core-machine",
+ "sp1-hypercube",
+ "sp1-primitives",
+ "sp1-prover",
+ "sp1-prover-types",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "sp1-sdk"
 version = "6.3.1"
 dependencies = [
@@ -7100,6 +7121,7 @@ dependencies = [
  "sp1-prover",
  "sp1-prover-types",
  "sp1-recursion-executor",
+ "sp1-rocm",
  "sp1-verifier",
  "strum 0.27.2",
  "tempfile",

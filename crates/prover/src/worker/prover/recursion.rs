@@ -689,6 +689,8 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
     }
 
     pub async fn run_shrink_wrap(&self, request: RawTaskRequest) -> Result<(), TaskError> {
+        let total_start = std::time::Instant::now();
+        tracing::info!("shrink-wrap stage: download start");
         let RawTaskRequest { inputs, outputs, .. } = request;
         let [compress_proof_artifact] = inputs.try_into().unwrap();
         let [wrap_proof_artifact] = outputs.try_into().unwrap();
@@ -698,19 +700,28 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
             .download(&compress_proof_artifact)
             .instrument(tracing::debug_span!("download compress proof"))
             .await?;
+        tracing::info!(elapsed = ?total_start.elapsed(), "shrink-wrap stage: shrink start");
 
+        let shrink_start = std::time::Instant::now();
         let shrink_proof = self
             .shrink_prover
             .prove(compress_proof)
             .instrument(tracing::info_span!("prove shrink"))
             .await?;
+        tracing::info!(elapsed = ?shrink_start.elapsed(), "shrink-wrap stage: shrink done");
 
         tracing::debug_span!("verify shrink proof")
             .in_scope(|| self.shrink_prover.verify(&shrink_proof))?;
 
+        let wrap_init_start = std::time::Instant::now();
+        tracing::info!("shrink-wrap stage: wrap prover init start");
         let wrap_prover = self.wrap_prover().await?;
+        tracing::info!(elapsed = ?wrap_init_start.elapsed(), "shrink-wrap stage: wrap prover init done");
+        let wrap_start = std::time::Instant::now();
+        tracing::info!("shrink-wrap stage: outer wrap start");
         let wrap_proof =
             wrap_prover.prove(shrink_proof).instrument(tracing::info_span!("prove wrap")).await?;
+        tracing::info!(elapsed = ?wrap_start.elapsed(), "shrink-wrap stage: outer wrap done");
 
         tracing::debug_span!("verify wrap proof").in_scope(|| wrap_prover.verify(&wrap_proof))?;
 
@@ -718,6 +729,8 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
             .upload(&wrap_proof_artifact, wrap_proof)
             .instrument(tracing::debug_span!("upload wrap proof"))
             .await?;
+
+        tracing::info!(elapsed = ?total_start.elapsed(), "shrink-wrap stage: done");
 
         Ok(())
     }
@@ -793,6 +806,8 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
     }
 
     pub async fn run_plonk(&self, request: RawTaskRequest) -> Result<(), TaskError> {
+        let total_start = std::time::Instant::now();
+        tracing::info!("plonk stage: start");
         let RawTaskRequest { inputs, outputs, .. } = request;
         let [wrap_proof_artifact] = inputs.try_into().unwrap();
         let [plonk_proof_artifact] = outputs.try_into().unwrap();
@@ -802,8 +817,12 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
             .instrument(tracing::debug_span!("download wrap proof"))
             .await?;
 
+        let artifacts_start = std::time::Instant::now();
         let build_dir = try_build_plonk_artifacts_dir(&wrap_proof.vk, &wrap_proof.proof).await?;
+        tracing::info!(elapsed = ?artifacts_start.elapsed(), "plonk stage: circuit artifacts ready");
 
+        tracing::info!("plonk stage: gnark prove start");
+        let prove_start = std::time::Instant::now();
         let plonk_proof = tokio::task::spawn_blocking(move || -> Result<_, anyhow::Error> {
             let SP1WrapProof { vk: wrap_vk, proof: wrap_proof } = wrap_proof;
             let input = SP1ShapedWitnessValues {
@@ -851,11 +870,13 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
         .await
         .map_err(|e| TaskError::Fatal(anyhow::anyhow!("Plonk proof task panicked: {}", e)))?
         .map_err(TaskError::Fatal)?;
+        tracing::info!(elapsed = ?prove_start.elapsed(), "plonk stage: gnark prove and verify done");
 
         self.artifact_client
             .upload(&plonk_proof_artifact, plonk_proof)
             .instrument(tracing::debug_span!("upload plonk proof"))
             .await?;
+        tracing::info!(elapsed = ?total_start.elapsed(), "plonk stage: done");
         Ok(())
     }
 

@@ -44,6 +44,22 @@ impl Clone for SP1LocalNode {
 }
 
 impl SP1LocalNode {
+    /// Stops and drains the local node's background task handlers.
+    ///
+    /// Call this before releasing resources captured by the worker tasks. Dropping a `JoinSet`
+    /// aborts its tasks, but it does not wait for their futures to release those resources.
+    pub async fn shutdown(self) {
+        match Arc::try_unwrap(self.inner) {
+            Ok(mut inner) => inner._tasks.shutdown().await,
+            Err(inner) => {
+                tracing::warn!(
+                    strong_count = Arc::strong_count(&inner),
+                    "local node shutdown could not drain shared task handlers"
+                );
+            }
+        }
+    }
+
     pub fn core(&self) -> &SP1NodeCore {
         &self.inner.core
     }

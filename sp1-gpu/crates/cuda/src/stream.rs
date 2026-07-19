@@ -250,6 +250,10 @@ where
     // Mark GPU done
     state.done = true;
 
+    // The callback runs after all earlier stream work. Release its worker immediately instead of
+    // retaining it until the future is polled and dropped.
+    state.task.take();
+
     // If we have a waker, wake it so poll() is called again
     if let Some(ref waker) = state.waker {
         waker.wake_by_ref();
@@ -268,7 +272,9 @@ where
         // If the stream is done, return the result
         if state.done {
             // GPU has reached the callback
-            return Poll::Ready(state.result);
+            let result = state.result;
+            state.task.take();
+            return Poll::Ready(result);
         }
 
         //  If not done, check the stream's status
@@ -276,6 +282,10 @@ where
             Ok(()) => {
                 state.done = true;
                 state.result = Ok(());
+                // HIP can report an idle stream before its queued host callback runs. The raw
+                // callback state may then live longer than this future, so it must not retain the
+                // worker that owns the stream.
+                state.task.take();
                 return Poll::Ready(Ok(()));
             }
             Err(CudaError::NotReady) => {

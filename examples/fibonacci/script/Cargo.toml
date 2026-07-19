@@ -14,6 +14,9 @@ tracing = "0.1"
 [build-dependencies]
 sp1-build = { workspace = true }
 
+[features]
+rocm = ["sp1-sdk/rocm"]
+
 [[bin]]
 name = "plonk_bn254"
 path = "bin/plonk_bn254.rs"
@@ -41,3 +44,13 @@ path = "bin/network.rs"
 [[bin]]
 name = "fibonacci-script"
 path = "src/main.rs"
+
+[[bin]]
+name = "rocm_bench"
+path = "bin/rocm_bench.rs"
+required-features = ["rocm"]
+
+[[bin]]
+name = "rocm_setup_stress"
+path = "bin/rocm_setup_stress.rs"
+required-features = ["rocm"]

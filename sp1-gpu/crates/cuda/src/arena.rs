@@ -37,8 +37,8 @@ impl RocmAllocator {
     pub fn selected() -> Self {
         static SELECTED: OnceLock<RocmAllocator> = OnceLock::new();
         *SELECTED.get_or_init(|| match std::env::var("SP1_ROCM_ALLOCATOR").as_deref() {
-            Ok("async") => Self::Async,
-            Ok("arena") | Err(_) => Self::Arena,
+            Ok("arena") => Self::Arena,
+            Ok("async") | Err(_) => Self::Async,
             Ok(value) => panic!("invalid SP1_ROCM_ALLOCATOR={value}; expected `arena` or `async`"),
         })
     }
@@ -105,11 +105,19 @@ impl DeviceSlabCache {
         }
         drop(cached);
 
-        match Slab::allocate(size) {
+        self.allocate_with_retry(size, Slab::allocate)
+    }
+
+    fn allocate_with_retry(
+        &self,
+        size: usize,
+        mut allocate: impl FnMut(usize) -> Result<Slab, CudaError>,
+    ) -> Result<Slab, CudaError> {
+        match allocate(size) {
             Ok(slab) => Ok(slab),
             Err(CudaError::OutOfMemory) => {
                 self.release_all();
-                Slab::allocate(size)
+                allocate(size)
             }
             Err(error) => Err(error),
         }
@@ -135,12 +143,18 @@ struct ProofArenaInner {
     id: u64,
     slabs: Mutex<Vec<Arc<Slab>>>,
     next_slab_size: AtomicUsize,
-    completion: Mutex<Option<CudaEvent>>,
+    lifecycle: Mutex<ArenaLifecycle>,
+}
+
+#[derive(Debug, Default)]
+struct ArenaLifecycle {
+    root_closed: bool,
+    completions: Vec<CudaEvent>,
 }
 
 impl Drop for ProofArenaInner {
     fn drop(&mut self) {
-        if let Some(event) = self.completion.get_mut().unwrap().take() {
+        for event in self.lifecycle.get_mut().unwrap().completions.drain(..) {
             event.synchronize().expect("proof arena completion event failed");
         }
         let slabs = self
@@ -164,7 +178,7 @@ impl ProofArena {
             id: NEXT_ARENA_ID.fetch_add(1, Ordering::Relaxed),
             slabs: Mutex::new(vec![first]),
             next_slab_size: AtomicUsize::new(INITIAL_SLAB * 2),
-            completion: Mutex::new(None),
+            lifecycle: Mutex::new(ArenaLifecycle::default()),
         })))
     }
 
@@ -172,13 +186,44 @@ impl ProofArena {
         self.0.id
     }
 
-    pub fn finish(&self, event: CudaEvent) {
-        let previous = self.0.completion.lock().unwrap().replace(event);
-        assert!(previous.is_none(), "proof arena finished more than once");
+    pub(crate) fn close_root(
+        &self,
+        record_completion: impl FnOnce() -> Result<CudaEvent, CudaError>,
+    ) -> Result<(), CudaError> {
+        let mut lifecycle = self.0.lifecycle.lock().unwrap();
+        lifecycle.root_closed = true;
+        lifecycle.completions.push(record_completion()?);
+        Ok(())
+    }
+
+    pub(crate) fn cancel_root(
+        &self,
+        synchronize: impl FnOnce() -> Result<(), CudaError>,
+    ) -> Result<(), CudaError> {
+        let mut lifecycle = self.0.lifecycle.lock().unwrap();
+        lifecycle.root_closed = true;
+        synchronize()
+    }
+
+    pub(crate) fn join_child(
+        &self,
+        join_parent: impl FnOnce() -> Result<(), CudaError>,
+        record_late_completion: impl FnOnce() -> Result<CudaEvent, CudaError>,
+    ) -> Result<(), CudaError> {
+        let mut lifecycle = self.0.lifecycle.lock().unwrap();
+        join_parent()?;
+        if lifecycle.root_closed {
+            lifecycle.completions.push(record_late_completion()?);
+        }
+        Ok(())
     }
 
     fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
-        for slab in self.0.slabs.lock().unwrap().iter() {
+        // Keep the slab list locked through growth. Without this lock, many
+        // task streams can all miss the current slabs and each allocate the
+        // next geometric slab. Bump allocation inside each slab stays atomic.
+        let mut slabs = self.0.slabs.lock().unwrap();
+        for slab in slabs.iter() {
             if let Some(ptr) = slab.try_allocate(layout) {
                 return Ok(ptr);
             }
@@ -196,7 +241,7 @@ impl ProofArena {
             self.0.next_slab_size.store(current.saturating_mul(2).min(MAX_SLAB), Ordering::Release);
         }
         let ptr = slab.try_allocate(layout).ok_or(AllocError)?;
-        self.0.slabs.lock().unwrap().push(slab);
+        slabs.push(slab);
         Ok(ptr)
     }
 }
@@ -284,4 +329,58 @@ pub fn shutdown_slab_cache() {
 
 fn round_up(value: usize, align: usize) -> Option<usize> {
     value.checked_add(align - 1).map(|value| value & !(align - 1))
+}
+
+#[cfg(all(test, feature = "rocm"))]
+mod tests {
+    use super::{CudaError, DeviceSlabCache, ProofArena, Slab, MIB};
+    use std::alloc::Layout;
+
+    #[test]
+    fn concurrent_growth_allocates_one_geometric_sequence() {
+        let arena = ProofArena::new().expect("failed to create proof arena");
+        std::thread::scope(|scope| {
+            for _ in 0..64 {
+                let arena = arena.clone();
+                scope.spawn(move || {
+                    arena
+                        .allocate(Layout::from_size_align(64 * MIB, 256).unwrap())
+                        .expect("concurrent arena allocation failed");
+                });
+            }
+        });
+
+        assert_eq!(arena.0.slabs.lock().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn out_of_memory_releases_cache_and_retries_once() {
+        let cache = DeviceSlabCache::default();
+        cache.recycle(vec![Slab::allocate(MIB).expect("failed to allocate cached test slab")]);
+
+        let mut attempts = 0;
+        let result = cache.allocate_with_retry(2 * MIB, |_| {
+            attempts += 1;
+            Err(CudaError::OutOfMemory)
+        });
+
+        let error = result.unwrap_err();
+        assert_eq!(error, CudaError::OutOfMemory);
+        assert_eq!(error.to_string(), "out of GPU memory");
+        assert_eq!(attempts, 2);
+        assert!(cache.slabs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn completed_slab_is_reused() {
+        let cache = DeviceSlabCache::default();
+        let slab = Slab::allocate(MIB).expect("failed to allocate reusable test slab");
+        let ptr = slab.ptr;
+        cache.recycle(vec![slab]);
+
+        let reused = cache.acquire(MIB).expect("failed to reuse cached slab");
+        assert_eq!(reused.ptr, ptr);
+        cache.recycle(vec![reused]);
+        cache.release_all();
+    }
 }

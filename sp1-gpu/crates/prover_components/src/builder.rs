@@ -96,7 +96,19 @@ pub async fn cuda_worker_builder_with_machine(
     scope: TaskScope,
     machine: Machine<SP1Field, RiscvAir<SP1Field>>,
 ) -> SP1WorkerBuilder<SP1CudaProverComponents> {
-    // Create a prover permits, assuming a single proof happens at a time.
+    #[cfg(feature = "rocm")]
+    let prover_permits = {
+        let permits = std::env::var("SP1_ROCM_PROVER_PERMITS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|permits| *permits > 0)
+            .unwrap_or(1);
+        tracing::info!(permits, "ROCm prover work permits");
+        ProverSemaphore::new(permits)
+    };
+
+    // Keep CUDA's existing single-permit behavior unchanged.
+    #[cfg(not(feature = "rocm"))]
     let prover_permits = ProverSemaphore::new(1);
 
     // Get the core options.

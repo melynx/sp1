@@ -607,13 +607,18 @@ class kb31_t {
     static inline uint32_t from_monty(uint32_t x) { return monty_reduce((uint64_t)x); }
 
     static inline uint32_t monty_reduce(uint64_t x) {
-        uint64_t t = (x * (uint64_t)MONTY_MU) & (uint64_t)MONTY_MASK;
-        uint64_t u = t * (uint64_t)MOD;
-        uint64_t x_sub_u = x - u;
-        bool over = x < u;
-        uint32_t x_sub_u_hi = (uint32_t)(x_sub_u >> MONTY_BITS);
-        uint32_t corr = over ? MOD : 0;
-        return x_sub_u_hi + corr;
+        // MONTY_MU * MOD == 1 (mod 2^32), so the low limb of
+        // (low(x) * MONTY_MU) * MOD is exactly low(x). The low-limb
+        // subtraction therefore cancels without a borrow. Compute only the
+        // high product limb and the final correction. This avoids the two
+        // full 64-bit products and the 64-bit subtraction in the direct
+        // formula, which are costly on RDNA.
+        uint32_t x_lo = static_cast<uint32_t>(x);
+        uint32_t x_hi = static_cast<uint32_t>(x >> MONTY_BITS);
+        uint32_t t = x_lo * MONTY_MU;
+        uint32_t u_hi = static_cast<uint32_t>((static_cast<uint64_t>(t) * MOD) >> MONTY_BITS);
+        uint32_t reduced = x_hi - u_hi;
+        return reduced + (x_hi < u_hi ? MOD : 0);
     }
 
     static inline kb31_t from_canonical_u32(uint32_t x) {

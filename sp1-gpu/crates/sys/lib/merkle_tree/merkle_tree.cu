@@ -21,11 +21,64 @@ __global__ void leafHash(
     }
 }
 
+#if defined(SP1_GPU_BACKEND_ROCM)
+
+// The generic state absorbs one field at a time and updates a dynamic index for
+// every load. KoalaBear always has an eight-field rate. Load each full rate
+// block directly while keeping the same state, permutation, and padding rules.
+__global__ void leafHashKoalaBear16Rocm(
+    poseidon2::KoalaBearHasher,
+    kb31_t* __restrict__ input,
+    kb31_t (*__restrict__ digests)[poseidon2_kb31_16::constants::DIGEST_WIDTH],
+    size_t width,
+    size_t tree_height) {
+    constexpr size_t RATE = poseidon2_kb31_16::constants::RATE;
+    constexpr size_t WIDTH = poseidon2_kb31_16::constants::WIDTH;
+    size_t matrix_height = size_t(1) << tree_height;
+
+    for (size_t row = (blockIdx.x * blockDim.x) + threadIdx.x; row < matrix_height;
+         row += blockDim.x * gridDim.x) {
+        __align__(16) kb31_t state[WIDTH];
+#pragma unroll
+        for (size_t i = 0; i < WIDTH; i++) {
+            state[i].set_to_zero();
+        }
+
+        size_t column = 0;
+        for (; column + RATE <= width; column += RATE) {
+#pragma unroll
+            for (size_t i = 0; i < RATE; i++) {
+                state[i] = input[(column + i) * matrix_height + row];
+            }
+            poseidon2::KoalaBearHasher::permute(state, state);
+        }
+
+        if (column < width) {
+            for (size_t i = 0; column + i < width; i++) {
+                state[i] = input[(column + i) * matrix_height + row];
+            }
+            poseidon2::KoalaBearHasher::permute(state, state);
+        }
+
+        size_t digest_idx = row + (matrix_height - 1);
+#pragma unroll
+        for (size_t i = 0; i < poseidon2_kb31_16::constants::DIGEST_WIDTH; i++) {
+            digests[digest_idx][i] = state[i];
+        }
+    }
+}
+
+#endif
+
 extern "C" void* leaf_hash_merkle_tree_koala_bear_16_kernel() {
+#if defined(SP1_GPU_BACKEND_ROCM)
+    return (void*)leafHashKoalaBear16Rocm;
+#else
     return (void*)leafHash<
         poseidon2::KoalaBearHasher,
         poseidon2_kb31_16::KoalaBear,
         poseidon2::KoalaBearHasherState>;
+#endif
 }
 
 extern "C" void* leaf_hash_merkle_tree_bn254_kernel() {

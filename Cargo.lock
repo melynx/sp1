@@ -7391,6 +7391,7 @@ dependencies = [
  "itertools 0.14.0",
  "pin-project",
  "rand 0.8.6",
+ "serial_test",
  "slop-algebra 6.3.1",
  "slop-alloc",
  "slop-basefold",
@@ -7673,6 +7674,7 @@ version = "6.3.1"
 dependencies = [
  "bincode",
  "clap",
+ "libc",
  "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
  "sp1-core-executor",
  "sp1-core-machine",
@@ -8243,6 +8245,7 @@ version = "6.3.1"
 dependencies = [
  "bincode",
  "bytes",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

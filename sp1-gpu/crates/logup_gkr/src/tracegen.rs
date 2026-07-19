@@ -85,10 +85,6 @@ pub fn generate_first_layer<'a>(
         let alpha = input_data.alpha;
         let interactions = interactions.clone();
         let num_interactions = interactions.num_interactions;
-        let interaction_start_indices = unsafe { interaction_start_indices.owned_unchecked() };
-        let mut interaction_data = unsafe { interaction_data.owned_unchecked() };
-        let mut numerator = unsafe { numerator.owned_unchecked() };
-        let mut denominator = unsafe { denominator.owned_unchecked() };
         let real_height = input_data.main_poly_height(name).unwrap();
 
         const BLOCK_SIZE: usize = 256;

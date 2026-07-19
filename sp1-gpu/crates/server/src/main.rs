@@ -11,6 +11,13 @@ use sp1_cuda::client as cuda_client;
 use sp1_gpu_cudart::{initialize_device_and_ntt, run_in_place, shutdown_slab_cache, RocmAllocator};
 use std::path::PathBuf;
 
+#[cfg(feature = "rocm")]
+use std::{
+    fs::{File, OpenOptions},
+    os::fd::AsRawFd,
+    os::unix::fs::OpenOptionsExt,
+};
+
 mod server;
 
 #[derive(Debug, Parser)]
@@ -19,11 +26,63 @@ struct Args {
     version: bool,
 }
 
+#[cfg(feature = "rocm")]
+fn acquire_server_lock(device_id: u32) -> std::io::Result<Option<File>> {
+    let path = format!("/tmp/sp1-rocm-{device_id}.lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)?;
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(Some(file));
+    }
+
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        Ok(None)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(feature = "rocm")]
+fn configure_rocm_plonk_cache() -> bool {
+    fn read_setting(name: &str) -> Option<String> {
+        std::env::var_os(name).map(|value| {
+            value.into_string().unwrap_or_else(|_| panic!("{name} must contain valid UTF-8"))
+        })
+    }
+
+    let setting = read_setting("SP1_ROCM_PLONK_CACHE").or_else(|| read_setting("SP1_PLONK_CACHE"));
+    let enabled = match setting.as_deref() {
+        None | Some("1" | "true" | "on") => true,
+        Some("0" | "false" | "off") => false,
+        Some(value) => panic!(
+            "invalid ROCm Plonk cache setting `{value}`; expected `1`, `0`, `true`, `false`, \
+             `on`, or `off`"
+        ),
+    };
+
+    // This runs at process start, before the Tokio runtime or GPU worker
+    // threads exist. The Go prover reads this internal setting later.
+    unsafe {
+        std::env::set_var("SP1_PLONK_CACHE", if enabled { "1" } else { "0" });
+    }
+    enabled
+}
+
 #[cfg(all(feature = "cuda", feature = "rocm"))]
 compile_error!("features `cuda` and `rocm` are mutually exclusive");
 
 #[allow(clippy::print_stdout)]
 fn main() {
+    #[cfg(feature = "rocm")]
+    let plonk_cache_enabled = configure_rocm_plonk_cache();
+
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
@@ -44,6 +103,16 @@ fn main() {
     };
 
     let device_id = device_env.parse().expect("Expected only one GPU device as a u32");
+
+    #[cfg(feature = "rocm")]
+    let _server_lock = match acquire_server_lock(device_id).expect("failed to lock ROCm server") {
+        Some(lock) => lock,
+        None => {
+            eprintln!("A ROCm server is already starting or running for device {device_id}");
+            return;
+        }
+    };
+
     let socket_path = if is_rocm {
         PathBuf::from(format!("/tmp/sp1-rocm-{device_id}.sock"))
     } else {
@@ -53,6 +122,11 @@ fn main() {
     if is_rocm {
         eprintln!("ROCm allocator: {:?}", RocmAllocator::selected());
     }
+    #[cfg(feature = "rocm")]
+    eprintln!(
+        "ROCm Plonk circuit cache: {}",
+        if plonk_cache_enabled { "enabled" } else { "disabled" }
+    );
 
     // The visibility environment selects the physical GPU. Inside this process
     // the selected GPU is logical device zero.

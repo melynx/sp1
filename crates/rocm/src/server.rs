@@ -4,7 +4,8 @@
 mod native {
     use crate::RocmClientError;
     use std::{
-        os::unix::process::CommandExt,
+        fs::OpenOptions,
+        os::unix::{fs::OpenOptionsExt, process::CommandExt},
         path::{Path, PathBuf},
         process::Stdio,
     };
@@ -36,14 +37,41 @@ mod native {
     /// Start the server binary, ideally with systemd-run. If systemd (--user) is not available,
     /// we will run the binary as a daemon.
     async fn start_binary(rocm_id: u32, path: &Path) -> Result<Child, RocmClientError> {
+        let log_path =
+            std::env::var_os("SP1_ROCM_SERVER_LOG").map(PathBuf::from).unwrap_or_else(|| {
+                PathBuf::from(std::env::var("HOME").expect("$HOME is not set"))
+                    .join(".sp1")
+                    .join("logs")
+                    .join(format!("sp1-rocm-server-{rocm_id}.log"))
+            });
+        std::fs::create_dir_all(log_path.parent().expect("server log path has no parent"))
+            .map_err(|e| {
+                RocmClientError::new_connect(e, "Could not create the ROCm server log directory")
+            })?;
+        let log =
+            OpenOptions::new().create(true).append(true).mode(0o600).open(&log_path).map_err(
+                |e| RocmClientError::new_connect(e, "Could not open the ROCm server log"),
+            )?;
+        let log_stderr = log.try_clone().map_err(|e| {
+            RocmClientError::new_connect(e, "Could not clone the ROCm server log handle")
+        })?;
+
         let mut cmd = Command::new(path);
         if std::env::var_os("HIP_VISIBLE_DEVICES").is_none() {
             cmd.env("ROCR_VISIBLE_DEVICES", rocm_id.to_string());
         }
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
 
-        cmd.kill_on_drop(true)
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(log_stderr))
             .spawn()
             .map_err(|e| RocmClientError::new_connect(e, "Could not start `sp1-rocm-server`"))
     }

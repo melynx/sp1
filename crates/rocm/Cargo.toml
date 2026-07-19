@@ -33,6 +33,7 @@ thiserror = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls", "json"] }
 serde_json = { workspace = true }
 bytes = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 sp1-core-machine = { workspace = true }

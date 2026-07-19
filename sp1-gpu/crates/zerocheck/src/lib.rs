@@ -38,7 +38,7 @@ pub mod tests {
     use slop_multilinear::{full_geq, Mle, MleEval, Point};
     use slop_sumcheck::{partially_verify_sumcheck_proof, PartialSumcheckProof};
     use slop_tensor::Tensor;
-    use sp1_gpu_cudart::{run_in_place, run_sync_in_place, PinnedBuffer};
+    use sp1_gpu_cudart::{run_proof_in_place, run_sync_in_place, PinnedBuffer};
     use sp1_hypercube::air::{MachineAir, SP1AirBuilder};
     use sp1_hypercube::prover::ZerocheckAir;
     use sp1_hypercube::{
@@ -1692,7 +1692,7 @@ pub mod tests {
         let (machine, record, program) =
             tracegen_setup::setup(&test_artifacts::FIBONACCI_ELF, SP1Stdin::new()).await;
 
-        run_in_place(|t| async move {
+        run_proof_in_place(|t| async move {
             let mut rng = rand::thread_rng();
 
             let capacity = CORE_MAX_TRACE_SIZE as usize;

@@ -142,10 +142,7 @@ where
         let (hasher, compressor) = GC::default_hasher_and_compressor();
 
         // Copy root digest from device to host synchronously
-        let root = unsafe {
-            let digests = tree.digests.owned_unchecked();
-            digests[0].copy_into_host(scope)
-        };
+        let root = tree.digests[0].copy_into_host(scope);
 
         let total_width = tensor.sizes()[0];
         let hash = hasher.hash_iter([
@@ -377,7 +374,7 @@ mod tests {
     use slop_futures::queue::WorkerQueue;
     use slop_multilinear::Mle;
     use slop_stacked::interleave_multilinears_with_fixed_rate;
-    use sp1_gpu_cudart::{run_in_place, PinnedBuffer};
+    use sp1_gpu_cudart::{run_in_place, run_proof_in_place, PinnedBuffer, TaskPoolBuilder};
     use sp1_hypercube::prover::{DefaultTraceGenerator, ProverSemaphore, TraceGenerator};
 
     use sp1_core_machine::io::SP1Stdin;
@@ -391,11 +388,148 @@ mod tests {
     use slop_merkle_tree::{ComputeTcsOpenings, TensorCsProver};
 
     #[tokio::test]
+    async fn test_merkle_commits_release_task_workers() {
+        let pool = TaskPoolBuilder::new().num_tasks(2).build().unwrap();
+
+        for iteration in 0..128 {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let handle = pool
+                    .run_proof(|scope| async move {
+                        let tensor =
+                            Tensor::<SP1Field, TaskScope>::zeros_in([16, 32], scope.clone());
+                        let prover = Poseidon2SP1Field16CudaProver::new(&scope);
+                        let (root, data) = prover.commit_tensors(&tensor).unwrap();
+                        drop(data);
+                        root
+                    })
+                    .await;
+                handle.await.unwrap()
+            })
+            .await
+            .unwrap_or_else(|_| panic!("Merkle commit leaked a worker at iteration {iteration}"));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "ROCm Merkle performance benchmark"]
+    async fn benchmark_poseidon2_koala_bear_16() {
+        let log_height = std::env::var("SP1_MERKLE_BENCH_LOG_HEIGHT")
+            .ok()
+            .map(|value| value.parse::<usize>().expect("invalid benchmark log height"))
+            .unwrap_or(20);
+        let width = std::env::var("SP1_MERKLE_BENCH_WIDTH")
+            .ok()
+            .map(|value| value.parse::<usize>().expect("invalid benchmark width"))
+            .unwrap_or(128);
+        let warmups = std::env::var("SP1_MERKLE_BENCH_WARMUPS")
+            .ok()
+            .map(|value| value.parse::<usize>().expect("invalid benchmark warmup count"))
+            .unwrap_or(2);
+        let iterations = std::env::var("SP1_MERKLE_BENCH_ITERATIONS")
+            .ok()
+            .map(|value| value.parse::<usize>().expect("invalid benchmark iteration count"))
+            .unwrap_or(5);
+        let handle = run_in_place(move |scope| async move {
+            let tensor = Tensor::<SP1Field, TaskScope>::zeros_in(
+                [width, 1usize << log_height],
+                scope.clone(),
+            );
+            let prover = Poseidon2SP1Field16CudaProver::new(&scope);
+            scope.synchronize_blocking().unwrap();
+
+            for _ in 0..warmups {
+                let (root, data) = prover.commit_tensors(&tensor).unwrap();
+                std::hint::black_box(root);
+                drop(data);
+            }
+
+            let mut elapsed = Vec::with_capacity(iterations);
+            for _ in 0..iterations {
+                let start = std::time::Instant::now();
+                let (root, data) = prover.commit_tensors(&tensor).unwrap();
+                elapsed.push(start.elapsed());
+                std::hint::black_box(root);
+                drop(data);
+            }
+
+            elapsed.sort_unstable();
+            let median = elapsed[elapsed.len() / 2];
+            let p95_index = ((elapsed.len() * 95).div_ceil(100)).saturating_sub(1);
+            let p95 = elapsed[p95_index];
+            println!(
+                "merkle_bench log_height={log_height} width={width} \
+                 warmups={warmups} iterations={iterations} median_ms={:.3} p95_ms={:.3}",
+                median.as_secs_f64() * 1_000.0,
+                p95.as_secs_f64() * 1_000.0,
+            );
+        })
+        .await;
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "ROCm BN254 Merkle performance benchmark"]
+    async fn benchmark_poseidon2_bn254_3() {
+        let log_height = std::env::var("SP1_MERKLE_BENCH_LOG_HEIGHT")
+            .ok()
+            .map(|value| value.parse::<usize>().expect("invalid benchmark log height"))
+            .unwrap_or(20);
+        let width = std::env::var("SP1_MERKLE_BENCH_WIDTH")
+            .ok()
+            .map(|value| value.parse::<usize>().expect("invalid benchmark width"))
+            .unwrap_or(64);
+        let warmups = std::env::var("SP1_MERKLE_BENCH_WARMUPS")
+            .ok()
+            .map(|value| value.parse::<usize>().expect("invalid benchmark warmup count"))
+            .unwrap_or(2);
+        let iterations = std::env::var("SP1_MERKLE_BENCH_ITERATIONS")
+            .ok()
+            .map(|value| value.parse::<usize>().expect("invalid benchmark iteration count"))
+            .unwrap_or(5);
+        let handle = run_in_place(move |scope| async move {
+            let tensor = Tensor::<SP1Field, TaskScope>::zeros_in(
+                [width, 1usize << log_height],
+                scope.clone(),
+            );
+            let prover = Poseidon2Bn254CudaProver::new(&scope);
+            scope.synchronize_blocking().unwrap();
+
+            for _ in 0..warmups {
+                let (root, data) = prover.commit_tensors(&tensor).unwrap();
+                std::hint::black_box(root);
+                drop(data);
+            }
+
+            let mut elapsed = Vec::with_capacity(iterations);
+            for _ in 0..iterations {
+                let start = std::time::Instant::now();
+                let (root, data) = prover.commit_tensors(&tensor).unwrap();
+                elapsed.push(start.elapsed());
+                std::hint::black_box(root);
+                drop(data);
+            }
+
+            elapsed.sort_unstable();
+            let median = elapsed[elapsed.len() / 2];
+            let p95_index = ((elapsed.len() * 95).div_ceil(100)).saturating_sub(1);
+            let p95 = elapsed[p95_index];
+            println!(
+                "bn254_merkle_bench log_height={log_height} width={width} \
+                 warmups={warmups} iterations={iterations} median_ms={:.3} p95_ms={:.3}",
+                median.as_secs_f64() * 1_000.0,
+                p95.as_secs_f64() * 1_000.0,
+            );
+        })
+        .await;
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_poseidon2_koala_bear_16() {
         let (machine, record, program) =
             tracegen_setup::setup(&test_artifacts::FIBONACCI_ELF, SP1Stdin::new()).await;
 
-        run_in_place(|scope| async move {
+        run_proof_in_place(|scope| async move {
             let old_prover = slop_merkle_tree::Poseidon2KoalaBear16Prover::default();
 
             // Generate traces using the host tracegen.
