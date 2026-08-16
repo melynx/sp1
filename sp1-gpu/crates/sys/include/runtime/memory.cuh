@@ -4,6 +4,8 @@
 
 extern "C" rustCudaError_t cuda_malloc(void** devPtr, size_t size);
 
+extern "C" rustCudaError_t cuda_malloc_managed(void** devPtr, size_t size);
+
 extern "C" rustCudaError_t cuda_malloc_host(void** devPtr, size_t size);
 
 extern "C" rustCudaError_t cuda_host_register(void* hostPtr, size_t size);

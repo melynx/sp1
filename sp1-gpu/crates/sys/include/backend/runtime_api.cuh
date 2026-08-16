@@ -39,6 +39,7 @@ using cudaStream_t = hipStream_t;
 #define cudaLaunchHostFunc hipLaunchHostFunc
 #define cudaLaunchKernel hipLaunchKernel
 #define cudaMalloc hipMalloc
+#define cudaMallocManaged hipMallocManaged
 #define cudaMallocAsync hipMallocAsync
 #define cudaMallocHost hipHostMalloc
 #define cudaMemcpy hipMemcpy
