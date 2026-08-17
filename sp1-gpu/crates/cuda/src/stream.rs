@@ -2,11 +2,11 @@ use super::{CudaError, CudaEvent};
 use slop_alloc::mem::{CopyDirection, CopyError, DeviceMemory};
 use slop_alloc::{AllocError, Allocator};
 use sp1_gpu_sys::runtime::{
-    cuda_event_record, cuda_free_async, cuda_launch_host_function, cuda_malloc_async,
-    cuda_mem_copy_device_to_device_async, cuda_mem_copy_device_to_host_async,
-    cuda_mem_copy_host_to_device_async, cuda_mem_set_async, cuda_stream_create,
-    cuda_stream_destroy, cuda_stream_query, cuda_stream_synchronize, cuda_stream_wait_event,
-    CudaStreamHandle, Dim3, KernelPtr, DEFAULT_STREAM,
+    cuda_event_record, cuda_free, cuda_free_async, cuda_launch_host_function, cuda_malloc,
+    cuda_malloc_async, cuda_malloc_managed, cuda_mem_copy_device_to_device_async,
+    cuda_mem_copy_device_to_host_async, cuda_mem_copy_host_to_device_async, cuda_mem_set_async,
+    cuda_stream_create, cuda_stream_destroy, cuda_stream_query, cuda_stream_synchronize,
+    cuda_stream_wait_event, CudaStreamHandle, Dim3, KernelPtr, DEFAULT_STREAM,
 };
 use std::{
     alloc::Layout,
@@ -21,17 +21,99 @@ use std::{
 };
 use tokio::time::Interval;
 
+#[cfg(feature = "rocm")]
+use std::collections::HashMap;
+
 pub(crate) const INTERVAL_MS: u64 = 2000;
 
-#[derive(Debug, PartialEq, Eq, Hash)]
-#[repr(transparent)]
-pub struct CudaStream(pub(crate) CudaStreamHandle);
+#[cfg(feature = "rocm")]
+const MIB: usize = 1024 * 1024;
+#[cfg(feature = "rocm")]
+const LOW_MEMORY_CACHE_MAX_ALLOCATION: usize = MIB;
+#[cfg(feature = "rocm")]
+const LOW_MEMORY_CACHE_CAPACITY: usize = 8 * MIB;
+#[cfg(feature = "rocm")]
+const DEVICE_MIN_ALIGN: usize = 256;
+
+#[cfg(feature = "rocm")]
+#[derive(Debug, Default)]
+struct DeviceAllocationCache {
+    allocations: HashMap<usize, Vec<NonNull<u8>>>,
+    bytes: usize,
+}
+
+#[cfg(feature = "rocm")]
+impl DeviceAllocationCache {
+    fn eligible(layout: Layout) -> bool {
+        layout.size() > 0
+            && layout.size() <= LOW_MEMORY_CACHE_MAX_ALLOCATION
+            && layout.align() <= DEVICE_MIN_ALIGN
+    }
+
+    fn take(&mut self, layout: Layout) -> Option<NonNull<u8>> {
+        if !Self::eligible(layout) {
+            return None;
+        }
+        let ptr = self.allocations.get_mut(&layout.size())?.pop()?;
+        self.bytes -= layout.size();
+        Some(ptr)
+    }
+
+    fn recycle(&mut self, ptr: NonNull<u8>, layout: Layout) -> bool {
+        if !Self::eligible(layout)
+            || self
+                .bytes
+                .checked_add(layout.size())
+                .is_none_or(|bytes| bytes > LOW_MEMORY_CACHE_CAPACITY)
+        {
+            return false;
+        }
+        self.allocations.entry(layout.size()).or_default().push(ptr);
+        self.bytes += layout.size();
+        true
+    }
+
+    fn drain(&mut self) -> Vec<NonNull<u8>> {
+        self.bytes = 0;
+        std::mem::take(&mut self.allocations).into_values().flatten().collect()
+    }
+}
+
+#[derive(Debug)]
+pub struct CudaStream(
+    pub(crate) CudaStreamHandle,
+    #[cfg(feature = "rocm")] Mutex<DeviceAllocationCache>,
+);
+
+impl PartialEq for CudaStream {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for CudaStream {}
+
+impl std::hash::Hash for CudaStream {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.0, state);
+    }
+}
 
 unsafe impl Send for CudaStream {}
 unsafe impl Sync for CudaStream {}
 
 impl Drop for CudaStream {
     fn drop(&mut self) {
+        #[cfg(feature = "rocm")]
+        {
+            let cached = self.1.get_mut().unwrap().drain();
+            if !cached.is_empty() {
+                CudaError::result_from_ffi(unsafe { cuda_stream_synchronize(self.0) }).unwrap();
+                for ptr in cached {
+                    CudaError::result_from_ffi(unsafe { cuda_free(ptr.as_ptr().cast()) }).unwrap();
+                }
+            }
+        }
         if self.0 != unsafe { DEFAULT_STREAM } {
             // We unwrap because any cuda error should throw here.
             CudaError::result_from_ffi(unsafe { cuda_stream_destroy(self.0) }).unwrap();
@@ -40,13 +122,24 @@ impl Drop for CudaStream {
 }
 
 impl CudaStream {
+    fn from_handle(handle: CudaStreamHandle) -> Self {
+        #[cfg(feature = "rocm")]
+        {
+            Self(handle, Mutex::new(DeviceAllocationCache::default()))
+        }
+        #[cfg(not(feature = "rocm"))]
+        {
+            Self(handle)
+        }
+    }
+
     #[inline]
     pub(crate) fn create() -> Result<Self, CudaError> {
         let mut ptr = CudaStreamHandle(ptr::null_mut());
         CudaError::result_from_ffi(unsafe {
             cuda_stream_create(&mut ptr as *mut CudaStreamHandle)
         })?;
-        Ok(Self(ptr))
+        Ok(Self::from_handle(ptr))
     }
 
     /// # Safety
@@ -112,7 +205,7 @@ impl CudaStream {
 
 impl Default for CudaStream {
     fn default() -> Self {
-        Self(unsafe { DEFAULT_STREAM })
+        Self::from_handle(unsafe { DEFAULT_STREAM })
     }
 }
 
@@ -327,28 +420,233 @@ impl IntoFuture for CudaStream {
     }
 }
 
+#[cfg(feature = "rocm")]
+fn parse_managed_threshold_mib(value: &str) -> usize {
+    value.parse::<usize>().unwrap_or_else(|_| {
+        panic!("invalid SP1_ROCM_MANAGED_THRESHOLD_MB={value}; expected a non-negative integer")
+    })
+}
+
+#[cfg(feature = "rocm")]
+fn automatic_managed_threshold_mib(_total_memory: usize) -> usize {
+    0
+}
+
+#[cfg(feature = "rocm")]
+fn managed_threshold_bytes() -> Option<usize> {
+    use std::sync::OnceLock;
+
+    static THRESHOLD: OnceLock<Option<usize>> = OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        let configured_threshold = match std::env::var("SP1_ROCM_MANAGED_THRESHOLD_MB") {
+            Ok(value) => Some((parse_managed_threshold_mib(&value), "environment")),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                panic!("SP1_ROCM_MANAGED_THRESHOLD_MB must contain valid Unicode")
+            }
+        };
+
+        let (threshold_mib, source) = configured_threshold.unwrap_or_else(|| {
+            let total_memory = crate::cuda_memory_info().expect("failed to read ROCm GPU memory").1;
+            (
+                automatic_managed_threshold_mib(total_memory),
+                if crate::is_rocm_low_memory_gpu(total_memory) {
+                    "automatic low-memory profile"
+                } else {
+                    "automatic standard-memory profile"
+                },
+            )
+        });
+
+        if threshold_mib == 0 {
+            eprintln!("ROCm managed-memory threshold: disabled ({source})");
+            None
+        } else {
+            let threshold_bytes = threshold_mib.checked_mul(MIB).unwrap_or_else(|| {
+                panic!("SP1_ROCM_MANAGED_THRESHOLD_MB={threshold_mib} is too large")
+            });
+            eprintln!("ROCm managed-memory threshold: {threshold_mib} MiB ({source})");
+            Some(threshold_bytes)
+        }
+    })
+}
+
+#[cfg(not(feature = "rocm"))]
+fn managed_threshold_bytes() -> Option<usize> {
+    None
+}
+
+#[inline]
+fn allocation_uses_managed_memory(size: usize) -> bool {
+    managed_threshold_bytes().is_some_and(|threshold| size >= threshold)
+}
+
+#[cfg(feature = "rocm")]
+fn use_synchronous_device_allocation() -> bool {
+    use std::sync::OnceLock;
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let total_memory = crate::cuda_memory_info().expect("failed to read ROCm GPU memory").1;
+        let enabled = crate::is_rocm_low_memory_gpu(total_memory);
+        if enabled {
+            eprintln!(
+                "ROCm device allocation: synchronous with an 8 MiB per-stream reuse cache \
+                 (automatic low-memory profile)"
+            );
+        }
+        enabled
+    })
+}
+
+#[cfg(not(feature = "rocm"))]
+fn use_synchronous_device_allocation() -> bool {
+    false
+}
+
+#[cfg(feature = "rocm")]
+fn take_cached_device_allocation(stream: &CudaStream, layout: Layout) -> Option<NonNull<u8>> {
+    stream.1.lock().unwrap().take(layout)
+}
+
+#[cfg(not(feature = "rocm"))]
+fn take_cached_device_allocation(_stream: &CudaStream, _layout: Layout) -> Option<NonNull<u8>> {
+    None
+}
+
+#[cfg(feature = "rocm")]
+fn cache_device_allocation(stream: &CudaStream, ptr: NonNull<u8>, layout: Layout) -> bool {
+    stream.1.lock().unwrap().recycle(ptr, layout)
+}
+
+#[cfg(not(feature = "rocm"))]
+fn cache_device_allocation(_stream: &CudaStream, _ptr: NonNull<u8>, _layout: Layout) -> bool {
+    false
+}
+
 unsafe impl Allocator for CudaStream {
     #[inline]
     unsafe fn allocate(&self, layout: Layout) -> Result<ptr::NonNull<[u8]>, AllocError> {
         let mut ptr: *mut c_void = ptr::null_mut();
         unsafe {
-            CudaError::result_from_ffi(cuda_malloc_async(
-                &mut ptr as *mut *mut c_void,
-                layout.size(),
-                self.0,
-            ))
-            .map_err(|_| AllocError)?;
+            if allocation_uses_managed_memory(layout.size()) {
+                CudaError::result_from_ffi(cuda_stream_synchronize(self.0))
+                    .map_err(|_| AllocError)?;
+                CudaError::result_from_ffi(cuda_malloc_managed(
+                    &mut ptr as *mut *mut c_void,
+                    layout.size(),
+                ))
+                .map_err(|_| AllocError)?;
+            } else if use_synchronous_device_allocation() {
+                if let Some(cached) = take_cached_device_allocation(self, layout) {
+                    ptr = cached.as_ptr().cast();
+                } else {
+                    CudaError::result_from_ffi(cuda_stream_synchronize(self.0))
+                        .map_err(|_| AllocError)?;
+                    CudaError::result_from_ffi(cuda_malloc(
+                        &mut ptr as *mut *mut c_void,
+                        layout.size(),
+                    ))
+                    .map_err(|_| AllocError)?;
+                }
+            } else {
+                CudaError::result_from_ffi(cuda_malloc_async(
+                    &mut ptr as *mut *mut c_void,
+                    layout.size(),
+                    self.0,
+                ))
+                .map_err(|_| AllocError)?;
+            }
         };
         let ptr = ptr as *mut u8;
         Ok(NonNull::slice_from_raw_parts(NonNull::new_unchecked(ptr), layout.size()))
     }
 
     #[inline]
-    unsafe fn deallocate(&self, ptr: NonNull<u8>, _layout: Layout) {
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
         unsafe {
-            CudaError::result_from_ffi(cuda_free_async(ptr.as_ptr() as *mut c_void, self.0))
-                .unwrap()
+            if allocation_uses_managed_memory(layout.size()) || use_synchronous_device_allocation()
+            {
+                if allocation_uses_managed_memory(layout.size())
+                    || !cache_device_allocation(self, ptr, layout)
+                {
+                    CudaError::result_from_ffi(cuda_stream_synchronize(self.0)).unwrap();
+                    CudaError::result_from_ffi(cuda_free(ptr.as_ptr() as *const c_void)).unwrap();
+                }
+            } else {
+                CudaError::result_from_ffi(cuda_free_async(ptr.as_ptr() as *mut c_void, self.0))
+                    .unwrap()
+            }
         }
+    }
+}
+
+#[cfg(all(test, feature = "rocm"))]
+mod managed_memory_tests {
+    use super::*;
+
+    const GIB: usize = 1024 * 1024 * 1024;
+
+    #[test]
+    fn parses_managed_memory_threshold_mebibytes() {
+        assert_eq!(parse_managed_threshold_mib("0"), 0);
+        assert_eq!(parse_managed_threshold_mib("256"), 256);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected a non-negative integer")]
+    fn rejects_an_invalid_managed_memory_threshold() {
+        parse_managed_threshold_mib("invalid");
+    }
+
+    #[test]
+    fn disables_managed_memory_for_a_16_gib_rocm_gpu() {
+        assert_eq!(automatic_managed_threshold_mib(16 * GIB), 0);
+    }
+
+    #[test]
+    fn disables_managed_memory_for_a_20_gib_rocm_gpu() {
+        assert_eq!(automatic_managed_threshold_mib(20 * GIB), 0);
+    }
+
+    #[test]
+    fn reuses_only_an_exact_device_allocation_size() {
+        let mut cache = DeviceAllocationCache::default();
+        let layout = Layout::from_size_align(4096, 256).unwrap();
+        let ptr = NonNull::new(0x1000usize as *mut u8).unwrap();
+
+        assert!(cache.recycle(ptr, layout));
+        assert!(cache.take(Layout::from_size_align(2048, 256).unwrap()).is_none());
+        assert_eq!(cache.take(layout), Some(ptr));
+        assert_eq!(cache.bytes, 0);
+    }
+
+    #[test]
+    fn bounds_each_stream_device_allocation_cache() {
+        let mut cache = DeviceAllocationCache::default();
+        let one_mib = Layout::from_size_align(MIB, 256).unwrap();
+
+        for index in 0..8 {
+            let ptr = NonNull::new((index + 1) as *mut u8).unwrap();
+            assert!(cache.recycle(ptr, one_mib));
+        }
+
+        let extra = NonNull::new(0x1000usize as *mut u8).unwrap();
+        assert!(!cache.recycle(extra, one_mib));
+        assert_eq!(cache.bytes, LOW_MEMORY_CACHE_CAPACITY);
+    }
+
+    #[test]
+    fn bypasses_large_or_overaligned_device_allocations() {
+        let mut cache = DeviceAllocationCache::default();
+        let ptr = NonNull::new(0x1000usize as *mut u8).unwrap();
+
+        assert!(!cache.recycle(
+            ptr,
+            Layout::from_size_align(LOW_MEMORY_CACHE_MAX_ALLOCATION + 1, 256).unwrap()
+        ));
+        assert!(!cache.recycle(ptr, Layout::from_size_align(4096, 512).unwrap()));
+        assert_eq!(cache.bytes, 0);
     }
 }
 

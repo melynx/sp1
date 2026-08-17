@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use sp1_core_machine::riscv::RiscvAir;
-use sp1_gpu_cudart::{cuda_memory_info, TaskScope};
+use sp1_gpu_cudart::{cuda_memory_info, gpu_memory_gib, TaskScope};
+#[cfg(feature = "rocm")]
+use sp1_gpu_cudart::{is_rocm_low_memory_gpu, ROCM_LOW_MEMORY_MIN_GIB};
 
 use sp1_core_executor::{SP1CoreOpts, ELEMENT_THRESHOLD};
 use sp1_gpu_shard_prover::CudaShardProver;
@@ -18,21 +20,93 @@ pub const SHRINK_TRACE_ALLOCATION: usize = 1 << 25;
 /// Taken from "Total number of Cells" when generating traces for wrap. Plus an extra 5%.
 pub const WRAP_TRACE_ALLOCATION: usize = 85_376_340;
 
+#[cfg(feature = "rocm")]
+const LOW_MEMORY_DEFAULT_LOG2_SHARD_SIZE: usize = 23;
+#[cfg(feature = "rocm")]
+const LOW_MEMORY_MIN_LOG2_SHARD_SIZE: usize = 22;
+#[cfg(feature = "rocm")]
+const LOW_MEMORY_MAX_LOG2_SHARD_SIZE: usize = 24;
+
 use crate::{
     new_cuda_prover, CudaProverCoreComponents, CudaProverRecursionComponents,
     SP1CudaProverComponents,
 };
 
 pub fn local_gpu_opts() -> SP1CoreOpts {
+    let total_memory = cuda_memory_info().expect("failed to read GPU memory").1;
+    local_gpu_opts_for_memory(total_memory)
+}
+
+#[cfg(feature = "rocm")]
+fn parse_low_memory_log2_shard_size(value: &str) -> usize {
+    let log2_shard_size = value.parse::<usize>().unwrap_or_else(|_| {
+        panic!(
+            "invalid SP1_ROCM_LOW_MEMORY_LOG2_SHARD_SIZE={value}; expected an integer from \
+             {LOW_MEMORY_MIN_LOG2_SHARD_SIZE} through {LOW_MEMORY_MAX_LOG2_SHARD_SIZE}"
+        )
+    });
+
+    assert!(
+        (LOW_MEMORY_MIN_LOG2_SHARD_SIZE..=LOW_MEMORY_MAX_LOG2_SHARD_SIZE)
+            .contains(&log2_shard_size),
+        "invalid SP1_ROCM_LOW_MEMORY_LOG2_SHARD_SIZE={value}; expected an integer from \
+         {LOW_MEMORY_MIN_LOG2_SHARD_SIZE} through {LOW_MEMORY_MAX_LOG2_SHARD_SIZE}"
+    );
+
+    log2_shard_size
+}
+
+#[cfg(feature = "rocm")]
+fn low_memory_log2_shard_size() -> (usize, &'static str) {
+    match std::env::var("SP1_ROCM_LOW_MEMORY_LOG2_SHARD_SIZE") {
+        Ok(value) => (parse_low_memory_log2_shard_size(&value), "environment"),
+        Err(std::env::VarError::NotPresent) => {
+            (LOW_MEMORY_DEFAULT_LOG2_SHARD_SIZE, "automatic low-memory profile")
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("SP1_ROCM_LOW_MEMORY_LOG2_SHARD_SIZE must contain valid Unicode")
+        }
+    }
+}
+
+fn local_gpu_opts_for_memory(total_memory: usize) -> SP1CoreOpts {
     let mut opts = SP1CoreOpts::default();
+
+    let gpu_memory_total_gib = gpu_memory_gib(total_memory);
+
+    #[cfg(feature = "rocm")]
+    if gpu_memory_total_gib < ROCM_LOW_MEMORY_MIN_GIB {
+        panic!(
+            "Unsupported ROCm GPU memory: {gpu_memory_total_gib} GiB, must be at least \
+             {ROCM_LOW_MEMORY_MIN_GIB} GiB"
+        );
+    }
+
+    #[cfg(feature = "rocm")]
+    if is_rocm_low_memory_gpu(total_memory) {
+        let (log2_shard_size, source) = low_memory_log2_shard_size();
+        opts.shard_size = 1 << log2_shard_size;
+        opts.sharding_threshold.element_threshold = 1 << (log2_shard_size + 4);
+        opts.global_dependencies_opt = true;
+        opts.recompute_gkr_trace = true;
+
+        tracing::info!(
+            gpu_memory_total_gib,
+            source,
+            log2_shard_size,
+            shard_size = opts.shard_size,
+            shard_threshold = opts.sharding_threshold.element_threshold,
+            "Using ROCm low-memory prover profile"
+        );
+
+        return opts;
+    }
 
     let log2_shard_size = 24;
     opts.shard_size = 1 << log2_shard_size;
 
-    let gb = 1024.0 * 1024.0 * 1024.0;
-
-    // Get the amount of memory on the GPU.
-    let gpu_memory_gb: usize = (((cuda_memory_info().unwrap().1 as f64) / gb).ceil() as usize) + 4;
+    // Keep the existing four-GiB allowance used by the standard GPU profile.
+    let gpu_memory_gb = gpu_memory_total_gib + 4;
 
     if gpu_memory_gb < 24 {
         panic!("Unsupported GPU memory: {gpu_memory_gb}, must be at least 24GB");
@@ -54,6 +128,56 @@ pub fn local_gpu_opts() -> SP1CoreOpts {
     opts.recompute_gkr_trace = true;
 
     opts
+}
+
+#[cfg(all(test, feature = "rocm"))]
+mod tests {
+    use super::*;
+
+    const GIB: usize = 1024 * 1024 * 1024;
+
+    #[test]
+    fn uses_low_memory_options_for_a_16_gib_rocm_gpu() {
+        let opts = local_gpu_opts_for_memory(16 * GIB);
+
+        assert_eq!(opts.shard_size, 1 << LOW_MEMORY_DEFAULT_LOG2_SHARD_SIZE);
+        assert_eq!(
+            opts.sharding_threshold.element_threshold,
+            1 << (LOW_MEMORY_DEFAULT_LOG2_SHARD_SIZE + 4)
+        );
+        assert!(opts.global_dependencies_opt);
+        assert!(opts.recompute_gkr_trace);
+    }
+
+    #[test]
+    fn parses_supported_low_memory_shard_sizes() {
+        assert_eq!(parse_low_memory_log2_shard_size("22"), 22);
+        assert_eq!(parse_low_memory_log2_shard_size("23"), 23);
+        assert_eq!(parse_low_memory_log2_shard_size("24"), 24);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected an integer from 22 through 24")]
+    fn rejects_too_large_low_memory_shard_size() {
+        parse_low_memory_log2_shard_size("25");
+    }
+
+    #[test]
+    fn keeps_standard_options_for_a_20_gib_rocm_gpu() {
+        let opts = local_gpu_opts_for_memory(20 * GIB);
+
+        assert_eq!(opts.shard_size, 1 << 24);
+        assert_eq!(
+            opts.sharding_threshold.element_threshold,
+            ELEMENT_THRESHOLD - (1 << 26) - (1 << 25)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must be at least 16 GiB")]
+    fn rejects_a_rocm_gpu_below_16_gib() {
+        local_gpu_opts_for_memory(15 * GIB);
+    }
 }
 
 /// Create a [SP1CudaProverWorkerBuilder] with a default machine.

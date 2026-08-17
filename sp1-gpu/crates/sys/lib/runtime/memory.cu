@@ -6,6 +6,11 @@ extern "C" rustCudaError_t cuda_malloc(void** devPtr, size_t size) {
     return CUDA_SUCCESS_CSL;
 }
 
+extern "C" rustCudaError_t cuda_malloc_managed(void** devPtr, size_t size) {
+    CUDA_OK(cudaMallocManaged(devPtr, size));
+    return CUDA_SUCCESS_CSL;
+}
+
 extern "C" rustCudaError_t cuda_malloc_host(void** devPtr, size_t size) {
     CUDA_OK(cudaMallocHost(devPtr, size));
     return CUDA_SUCCESS_CSL;

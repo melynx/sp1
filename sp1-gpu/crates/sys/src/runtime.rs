@@ -15,6 +15,8 @@ extern "C" {
 
     pub fn cuda_malloc(ptr: *mut *mut c_void, count: usize) -> CudaRustError;
 
+    pub fn cuda_malloc_managed(ptr: *mut *mut c_void, count: usize) -> CudaRustError;
+
     pub fn cuda_free(ptr: *const c_void) -> CudaRustError;
 
     pub fn cuda_mem_get_info(free: *mut usize, total: *mut usize) -> CudaRustError;
