@@ -58,6 +58,16 @@ where
         )
         .await;
 
+        // The preprocessed trace buffer is allocated at the prover's full shard
+        // capacity and retained in the proving key as-is; log how much of it a
+        // setup actually fills so the retained VRAM can be accounted for.
+        tracing::info!(
+            used_elements = preprocessed_data.dense_data.preprocessed_offset,
+            capacity_elements = self.max_trace_size,
+            preprocessed_cols = preprocessed_data.dense_data.preprocessed_cols,
+            "setup preprocessed trace buffer usage"
+        );
+
         let inner = self.clone();
         let (pk, vk) = tokio::task::spawn_blocking(move || {
             inner.setup_from_preprocessed_data_and_traces(

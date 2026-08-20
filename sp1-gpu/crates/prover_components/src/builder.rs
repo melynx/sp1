@@ -14,8 +14,16 @@ use sp1_prover::{
     CORE_LOG_STACKING_HEIGHT,
 };
 
-pub const RECURSION_TRACE_ALLOCATION: usize = 1 << 27;
-pub const SHRINK_TRACE_ALLOCATION: usize = 1 << 25;
+// Trace buffer capacities in field elements (preprocessed + main, 6 bytes
+// per element on the device). The recursion shapes are fixed, so the peak
+// is deterministic: measured 2026-08-21 on a Groth16 job, every compress
+// shard used 90,177,536 elements, the shrink shard 21,757,952, the wrap
+// shard 81,788,928. Each capacity is retained for the life of the process
+// in every proving key built with that prover (five compress keys), so
+// these are sized to the measured peak plus ~10 % rather than the old
+// untuned powers of two. `generate_jagged_traces` asserts on overflow.
+pub const RECURSION_TRACE_ALLOCATION: usize = 96 << 20;
+pub const SHRINK_TRACE_ALLOCATION: usize = 24 << 20;
 
 /// Taken from "Total number of Cells" when generating traces for wrap. Plus an extra 5%.
 pub const WRAP_TRACE_ALLOCATION: usize = 85_376_340;

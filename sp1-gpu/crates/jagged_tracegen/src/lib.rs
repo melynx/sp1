@@ -223,6 +223,15 @@ async fn generate_jagged_traces(
             }
         }
     }
+    // `offset` is now the end of the real traces; the final padding below
+    // rounds it up to the stacking height. Fail here rather than write past
+    // the fixed-capacity device buffer.
+    let required = offset.next_multiple_of(1 << log_stacking_height);
+    assert!(
+        required <= dense_data.capacity(),
+        "trace buffer too small: need {required} elements, capacity {}",
+        dense_data.capacity()
+    );
     offset = initial_offset;
     cols_so_far = initial_cols;
 
@@ -645,6 +654,15 @@ async fn copy_main_jagged_traces(
     if main_table_index.contains_key("Global") && global_dependencies_opt {
         update_global_dependencies(dense_data, main_table_index);
     }
+
+    // The buffer is the prover's fixed-capacity trace area (preprocessed +
+    // main); report the peak so the per-prover allocation can be sized.
+    tracing::debug!(
+        used_elements = final_offset,
+        capacity_elements = dense_data.capacity(),
+        main_cols = final_cols,
+        "shard trace buffer usage"
+    );
 
     // Shrink the len of the dense data to match the actual size.
     unsafe {
