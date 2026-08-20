@@ -288,7 +288,7 @@ impl Server {
                 tracing::info!("Running setup");
                 let setup_elf = elf.clone();
                 #[cfg(feature = "rocm")]
-                if RocmAllocator::selected() == RocmAllocator::Async {
+                if RocmAllocator::selected() != RocmAllocator::Arena {
                     let persistent = match Self::persistent_node(ctx, machine).await {
                         Ok(persistent) => persistent,
                         Err(error) => return Response::InternalError(error),
@@ -345,7 +345,7 @@ impl Server {
                 {
                     return Response::ProverError(format!(
                         "ROCm arena allocator cannot safely run {mode:?}: one request retains all \
-                         recursive sub-stage allocations; restart with SP1_ROCM_ALLOCATOR=async"
+                         recursive sub-stage allocations; restart with SP1_ROCM_ALLOCATOR unset"
                     ));
                 }
                 let Some(cached) = ctx.pk_cache.get(&key).cloned() else {
@@ -361,7 +361,7 @@ impl Server {
                 let context = SP1Context::builder().proof_nonce(proof_nonce).build();
 
                 #[cfg(feature = "rocm")]
-                if RocmAllocator::selected() == RocmAllocator::Async {
+                if RocmAllocator::selected() != RocmAllocator::Arena {
                     let persistent = match Self::persistent_node(ctx, machine).await {
                         Ok(persistent) => persistent,
                         Err(error) => return Response::ProverError(error),

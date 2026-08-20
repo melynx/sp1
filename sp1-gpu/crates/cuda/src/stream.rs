@@ -487,15 +487,38 @@ fn use_synchronous_device_allocation() -> bool {
 
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        let total_memory = crate::cuda_memory_info().expect("failed to read ROCm GPU memory").1;
-        let enabled = crate::is_rocm_low_memory_gpu(total_memory);
+        let enabled = crate::RocmAllocator::selected() == crate::RocmAllocator::Sync;
         if enabled {
             eprintln!(
-                "ROCm device allocation: synchronous with an 8 MiB per-stream reuse cache \
-                 (automatic low-memory profile)"
+                "ROCm device allocation: synchronous, per-stream reuse cache {}",
+                if device_allocation_cache_enabled() {
+                    "enabled by SP1_ROCM_ALLOC_CACHE"
+                } else {
+                    "disabled"
+                }
             );
         }
         enabled
+    })
+}
+
+/// Whether freed small device blocks may be recycled to a later same-size
+/// allocation on the same stream without a stream sync.
+///
+/// Off by default: recycling without a sync is only safe if every consumer of
+/// the block runs on the allocating stream, and the July 2026 HIP-pool failures
+/// showed that does not hold for every buffer. Set `SP1_ROCM_ALLOC_CACHE=1` to
+/// re-enable it for comparison.
+#[cfg(feature = "rocm")]
+fn device_allocation_cache_enabled() -> bool {
+    use std::sync::OnceLock;
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("SP1_ROCM_ALLOC_CACHE").as_deref(),
+            Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+        )
     })
 }
 
@@ -506,6 +529,9 @@ fn use_synchronous_device_allocation() -> bool {
 
 #[cfg(feature = "rocm")]
 fn take_cached_device_allocation(stream: &CudaStream, layout: Layout) -> Option<NonNull<u8>> {
+    if !device_allocation_cache_enabled() {
+        return None;
+    }
     stream.1.lock().unwrap().take(layout)
 }
 
@@ -516,6 +542,9 @@ fn take_cached_device_allocation(_stream: &CudaStream, _layout: Layout) -> Optio
 
 #[cfg(feature = "rocm")]
 fn cache_device_allocation(stream: &CudaStream, ptr: NonNull<u8>, layout: Layout) -> bool {
+    if !device_allocation_cache_enabled() {
+        return false;
+    }
     stream.1.lock().unwrap().recycle(ptr, layout)
 }
 

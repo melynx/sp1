@@ -120,7 +120,7 @@ fn main() {
     };
     let backend_name = if is_rocm { "sp1-rocm-server" } else { "sp1-gpu-server" };
     if is_rocm {
-        eprintln!("ROCm allocator: {:?}", RocmAllocator::selected());
+        eprintln!("ROCm allocator: {}", RocmAllocator::describe());
     }
     #[cfg(feature = "rocm")]
     eprintln!(

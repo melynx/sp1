@@ -27,22 +27,59 @@ const DEVICE_MIN_ALIGN: usize = 256;
 static NEXT_ARENA_ID: AtomicU64 = AtomicU64::new(1);
 static SLAB_CACHE: OnceLock<DeviceSlabCache> = OnceLock::new();
 
+/// How device memory is allocated on ROCm, selected once per process from
+/// `SP1_ROCM_ALLOCATOR` and the GPU's memory size.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RocmAllocator {
+    /// Per-proof slab arena. Cannot run Groth16/Plonk (one request retains
+    /// every recursive sub-stage allocation) and tears the prover down after
+    /// each request.
     Arena,
+    /// `hipMallocAsync`/`hipFreeAsync` on HIP's stream-ordered pool.
     Async,
+    /// Plain synchronous `hipMalloc`/`hipFree`. Always used on 16–19 GiB GPUs:
+    /// the async pool over-retains freed memory there (the 2026-08-17
+    /// all-async run exhausted a 16 GiB card) and its block reuse was found
+    /// unsafe on RDNA in 2026-07. Request it explicitly on any GPU with
+    /// `SP1_ROCM_ALLOCATOR=sync`.
+    Sync,
 }
 
 impl RocmAllocator {
     pub fn selected() -> Self {
-        static SELECTED: OnceLock<RocmAllocator> = OnceLock::new();
-        *SELECTED.get_or_init(|| match std::env::var("SP1_ROCM_ALLOCATOR").as_deref() {
-            Ok("arena") => Self::Arena,
-            Ok("async") | Err(_) => Self::Async,
-            Ok(value) => panic!("invalid SP1_ROCM_ALLOCATOR={value}; expected `arena` or `async`"),
-        })
+        SELECTED.get_or_init(Self::resolve).0
+    }
+
+    /// The selected allocator plus the reason, for the startup banner.
+    pub fn describe() -> String {
+        let (allocator, reason) = SELECTED.get_or_init(Self::resolve);
+        format!("{allocator:?} ({reason})")
+    }
+
+    fn resolve() -> (Self, &'static str) {
+        let requested = std::env::var("SP1_ROCM_ALLOCATOR");
+        match requested.as_deref() {
+            Ok("arena") => (Self::Arena, "SP1_ROCM_ALLOCATOR=arena"),
+            Ok("sync") => (Self::Sync, "SP1_ROCM_ALLOCATOR=sync"),
+            Ok("async") | Err(_) => {
+                let total_memory =
+                    crate::cuda_memory_info().expect("failed to read ROCm GPU memory").1;
+                if crate::is_rocm_low_memory_gpu(total_memory) {
+                    (Self::Sync, "automatic low-memory profile: synchronous hipMalloc/hipFree on a 16-19 GiB GPU, `async` is not used here")
+                } else if requested.is_ok() {
+                    (Self::Async, "SP1_ROCM_ALLOCATOR=async: hipMallocAsync stream-ordered pool")
+                } else {
+                    (Self::Async, "default: hipMallocAsync stream-ordered pool")
+                }
+            }
+            Ok(value) => {
+                panic!("invalid SP1_ROCM_ALLOCATOR={value}; expected `arena`, `async`, or `sync`")
+            }
+        }
     }
 }
+
+static SELECTED: OnceLock<(RocmAllocator, &'static str)> = OnceLock::new();
 
 #[derive(Debug)]
 struct Slab {
