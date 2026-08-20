@@ -36,7 +36,13 @@ pub struct LocalWorkerClientInner {
     artifact_index: ProofArtifacts,
     input_task_queues: HashMap<TaskType, mpsc::Sender<(TaskId, RawTaskRequest)>>,
     task_channels: RwLock<HashMap<TaskId, MessageChannelState>>,
+    /// Number of times each task has been re-queued after a retryable failure.
+    retry_counts: RwLock<HashMap<TaskId, u32>>,
 }
+
+/// How many times a task that failed with a retryable error is re-queued before
+/// the local node fails it for good.
+pub const LOCAL_TASK_MAX_RETRIES: u32 = 2;
 
 impl LocalWorkerClientInner {
     fn create_id() -> TaskId {
@@ -70,8 +76,15 @@ impl LocalWorkerClientInner {
         let db = Arc::new(RwLock::new(HashMap::new()));
         let proof_index = Arc::new(RwLock::new(HashMap::new()));
         let task_channels = RwLock::new(HashMap::new());
-        let inner =
-            Self { db, proof_index, artifact_index, input_task_queues: task_queues, task_channels };
+        let retry_counts = RwLock::new(HashMap::new());
+        let inner = Self {
+            db,
+            proof_index,
+            artifact_index,
+            input_task_queues: task_queues,
+            task_channels,
+            retry_counts,
+        };
         (inner, LocalWorkerClientChannels { task_receivers: task_outputs })
     }
 }
@@ -117,9 +130,43 @@ impl LocalWorkerClient {
             TaskStatus::Succeeded | TaskStatus::FailedFatal | TaskStatus::FailedRetryable
         ) {
             self.inner.task_channels.write().await.remove(&task_id);
+            self.inner.retry_counts.write().await.remove(&task_id);
         }
 
         Ok(())
+    }
+
+    /// Re-queue a task that failed with a retryable error under its original id.
+    ///
+    /// The controller waits on the id it was given by `submit_task`, so a retry
+    /// must keep that id; submitting the request again would mint a new id that
+    /// nothing awaits and leave the proof waiting forever. Returns `Ok(false)`
+    /// without re-queuing once the task has been retried
+    /// [`LOCAL_TASK_MAX_RETRIES`] times; the caller then fails the task.
+    pub async fn retry_task(
+        &self,
+        kind: TaskType,
+        task_id: TaskId,
+        task: RawTaskRequest,
+    ) -> anyhow::Result<bool> {
+        if !self.inner.db.read().await.contains_key(&task_id) {
+            anyhow::bail!("task does not exist");
+        }
+        let attempt = {
+            let mut counts = self.inner.retry_counts.write().await;
+            let count = counts.entry(task_id.clone()).or_insert(0);
+            if *count >= LOCAL_TASK_MAX_RETRIES {
+                return Ok(false);
+            }
+            *count += 1;
+            *count
+        };
+        tracing::warn!(%task_id, ?kind, attempt, "re-queuing task after retryable error");
+        self.inner.input_task_queues[&kind]
+            .send((task_id, task))
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to re-queue task of kind {:?}: {e}", kind))?;
+        Ok(true)
     }
 
     /// Delete the artifacts a completed proof leaked - whatever is still tracked
@@ -222,6 +269,12 @@ impl WorkerClient for LocalWorkerClient {
             let mut channels = self.inner.task_channels.write().await;
             for task_id in &tasks {
                 channels.remove(task_id);
+            }
+        }
+        {
+            let mut counts = self.inner.retry_counts.write().await;
+            for task_id in &tasks {
+                counts.remove(task_id);
             }
         }
         Ok(())
@@ -434,5 +487,47 @@ mod tests {
                 "leaked artifact not deleted after proof {i}"
             );
         }
+    }
+
+    /// A retryable failure re-queues the task under the id the controller is
+    /// waiting on, at most [`LOCAL_TASK_MAX_RETRIES`] times; the retry count is
+    /// dropped with the task's other state when the proof completes.
+    #[tokio::test]
+    async fn retry_task_requeues_same_id_then_gives_up() {
+        let (client, mut channels) = LocalWorkerClient::init();
+        let rx = channels.task_receivers.get_mut(&TaskType::ProveShard).unwrap();
+        let proof_id = ProofId::new("proof-retry");
+        let request = controller_request(&proof_id, &[]);
+
+        let task_id = client.submit_task(TaskType::ProveShard, request).await.unwrap();
+        let (queued_id, request) = rx.recv().await.unwrap();
+        assert_eq!(queued_id, task_id);
+
+        let mut request = Some(request);
+        for _ in 0..LOCAL_TASK_MAX_RETRIES {
+            let again = request.take().unwrap();
+            assert!(client.retry_task(TaskType::ProveShard, task_id.clone(), again).await.unwrap());
+            let (queued_id, again) = rx.recv().await.unwrap();
+            assert_eq!(queued_id, task_id, "retry must keep the original task id");
+            request = Some(again);
+        }
+        assert!(
+            !client
+                .retry_task(TaskType::ProveShard, task_id.clone(), request.take().unwrap())
+                .await
+                .unwrap(),
+            "retries must be capped"
+        );
+        assert!(rx.try_recv().is_err(), "an exhausted retry must not re-queue");
+
+        // An unknown task cannot be retried.
+        let bogus = TaskId::new("not-a-task".to_string());
+        let bogus_request = controller_request(&proof_id, &[]);
+        assert!(client.retry_task(TaskType::ProveShard, bogus, bogus_request).await.is_err());
+
+        client.update_task_status(task_id.clone(), TaskStatus::FailedFatal).await.unwrap();
+        assert!(client.inner.retry_counts.read().await.is_empty());
+        client.complete_proof(proof_id, None, ProofRequestStatus::Completed, "").await.unwrap();
+        assert!(client.inner.db.read().await.is_empty());
     }
 }

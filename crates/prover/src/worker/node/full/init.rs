@@ -663,11 +663,35 @@ impl TaskOutput {
                 }
             }
             TaskStatus::FailedRetryable => {
+                // Re-queue under the same task id: the controller is waiting on
+                // it, and `submit_task` would mint a fresh id nothing awaits.
+                // The input queues are bounded and drained by the loop that is
+                // calling us, so the send must not block that loop.
                 let task = task_data.unwrap();
-                let res = worker_client.submit_task(task_type, task).await;
-                if let Err(e) = res {
-                    tracing::error!("Failed to submit retry, task: {:?}, error: {:?}", task_id, e);
-                }
+                let worker_client = worker_client.clone();
+                tokio::spawn(async move {
+                    match worker_client.retry_task(task_type, task_id.clone(), task).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::error!(%task_id, "retries exhausted, failing task");
+                            if let Err(e) = worker_client
+                                .update_task_status(task_id.clone(), TaskStatus::FailedFatal)
+                                .await
+                            {
+                                tracing::error!(%task_id, error = ?e, "Failed to fail task");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(%task_id, error = ?e, "Failed to re-queue task");
+                            if let Err(e) = worker_client
+                                .update_task_status(task_id.clone(), TaskStatus::FailedFatal)
+                                .await
+                            {
+                                tracing::error!(%task_id, error = ?e, "Failed to fail task");
+                            }
+                        }
+                    }
+                });
             }
             TaskStatus::FailedFatal => {
                 let res = worker_client
